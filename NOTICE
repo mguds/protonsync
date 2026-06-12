@@ -3,7 +3,8 @@ protonsync
 
 This project builds on, and distributes a patched build of, the following
 MIT-licensed open-source projects. Their copyright and license terms continue
-to apply to the corresponding code.
+to apply to the corresponding code. The full verbatim license texts with their
+original copyright notices are reproduced in THIRD_PARTY_LICENSES.md.
 
 1. rclone
    https://github.com/rclone/rclone
