@@ -1,0 +1,30 @@
+# Never commit secrets or local sync state
+rclone.conf
+*.conf
+*.token
+*.secret
+
+# Prebuilt binary is distributed via GitHub Releases, not committed to git
+# (it exceeds GitHub's 100 MB file limit and bloats history).
+protonsync-rclone
+protonsync-rclone.sha256
+rclone-proton-shared
+*.bin
+*.sha256
+
+# rclone-build scratch / build output
+rclone-build/build/
+rclone-build/protonsync-rclone
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~

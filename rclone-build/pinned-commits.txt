@@ -1,0 +1,7 @@
+# Upstream commits the protonsync rclone build is based on.
+# build.sh checks out exactly these commits before applying the patches in patches/.
+# All three repositories are MIT licensed (see ../NOTICE).
+
+rclone              https://github.com/rclone/rclone.git              1bbe758bc554a599a3af3ce43b125dc702a064ce
+proton-api-bridge   https://github.com/rclone/Proton-API-Bridge.git   ecd7d61c932f972bb9c2940b8a13832c0c50f61c
+go-proton-api       https://github.com/rclone/go-proton-api.git       5380dfa0d6205d9d00653af44f8ee5afdd9aa963

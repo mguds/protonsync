@@ -1,0 +1,499 @@
+diff --git a/cache.go b/cache.go
+index c3e99a5..f673a2e 100644
+--- a/cache.go
++++ b/cache.go
+@@ -160,8 +160,8 @@ func (protonDrive *ProtonDrive) _getLinkKRByID(ctx context.Context, linkID strin
+ 
+ /* The original non-caching version, which resolves the keyring recursively */
+ func (protonDrive *ProtonDrive) _getLinkKR(ctx context.Context, link *proton.Link) (*crypto.KeyRing, error) {
+-	if link.ParentLinkID == "" { // link is rootLink
+-		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++	if protonDrive.isShareRootLink(link) {
++		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -184,7 +184,7 @@ func (protonDrive *ProtonDrive) _getLinkKR(ctx context.Context, link *proton.Lin
+ 		return nil, err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -240,7 +240,7 @@ func (protonDrive *ProtonDrive) getLinkKR(ctx context.Context, link *proton.Link
+ 			return nil, err
+ 		}
+ 
+-		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{data.link.SignatureEmail})
++		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{data.link.SignatureEmail})
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/drive.go b/drive.go
+index ff5aa69..b5af0d0 100644
+--- a/drive.go
++++ b/drive.go
+@@ -24,6 +24,7 @@ type ProtonDrive struct {
+ 	userKR           *crypto.KeyRing
+ 	addrKRs          map[string]*crypto.KeyRing
+ 	addrData         map[string]proton.Address
++	publicKeyKRs     map[string]*crypto.KeyRing
+ 	signatureAddress string
+ 
+ 	cache                *cache
+@@ -144,6 +145,7 @@ func NewProtonDrive(ctx context.Context, config *common.Config, authHandler prot
+ 		userKR:           userKR,
+ 		addrKRs:          addrKRs,
+ 		addrData:         addrData,
++		publicKeyKRs:     make(map[string]*crypto.KeyRing),
+ 		signatureAddress: mainShare.Creator,
+ 
+ 		cache:                newCache(config.EnableCaching, config.GetLogger()),
+@@ -182,17 +184,47 @@ func addKeysFromKR(kr *crypto.KeyRing, newKRs ...*crypto.KeyRing) error {
+ 	return nil
+ }
+ 
+-func (protonDrive *ProtonDrive) getSignatureVerificationKeyring(emailAddresses []string, verificationAddrKRs ...*crypto.KeyRing) (*crypto.KeyRing, error) {
++func (protonDrive *ProtonDrive) getPublicKeyringForEmail(ctx context.Context, emailAddress string) (*crypto.KeyRing, error) {
++	if kr, ok := protonDrive.publicKeyKRs[emailAddress]; ok {
++		return kr, nil
++	}
++
++	publicKeys, _, err := protonDrive.c.GetPublicKeys(ctx, emailAddress)
++	if err != nil {
++		return nil, err
++	}
++
++	kr, err := publicKeys.GetKeyRing()
++	if err != nil {
++		return nil, err
++	}
++	protonDrive.publicKeyKRs[emailAddress] = kr
++	return kr, nil
++}
++
++func (protonDrive *ProtonDrive) getSignatureVerificationKeyring(ctx context.Context, emailAddresses []string, verificationAddrKRs ...*crypto.KeyRing) (*crypto.KeyRing, error) {
+ 	ret, err := crypto.NewKeyRing(nil)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	for _, emailAddress := range emailAddresses {
++		if emailAddress == "" {
++			continue
++		}
+ 		if addr, ok := protonDrive.addrData[emailAddress]; ok {
+ 			if err := addKeysFromKR(ret, protonDrive.addrKRs[addr.ID]); err != nil {
+ 				return nil, err
+ 			}
++			continue
++		}
++
++		publicKR, err := protonDrive.getPublicKeyringForEmail(ctx, emailAddress)
++		if err != nil {
++			return nil, err
++		}
++		if err := addKeysFromKR(ret, publicKR); err != nil {
++			return nil, err
+ 		}
+ 	}
+ 
+diff --git a/file.go b/file.go
+index e5d6263..3db2c53 100644
+--- a/file.go
++++ b/file.go
+@@ -57,7 +57,7 @@ func (protonDrive *ProtonDrive) GetActiveRevisionAttrs(ctx context.Context, link
+ 		return nil, err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{revisionMetadata.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{revisionMetadata.SignatureEmail})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -114,7 +114,7 @@ func (protonDrive *ProtonDrive) GetActiveRevisionWithAttrs(ctx context.Context,
+ 		return nil, nil, err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.FileProperties.ActiveRevision.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.FileProperties.ActiveRevision.SignatureEmail})
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+diff --git a/file_download.go b/file_download.go
+index 2905690..44af8c5 100644
+--- a/file_download.go
++++ b/file_download.go
+@@ -70,7 +70,7 @@ func (reader *FileDownloadReader) populateBufferOnRead() (err error) {
+ 		defer utility.CheckClose(blockReader, &err)
+ 
+ 		var signatureVerificationKR *crypto.KeyRing
+-		signatureVerificationKR, err = reader.protonDrive.getSignatureVerificationKeyring([]string{reader.link.SignatureEmail}, reader.nodeKR)
++		signatureVerificationKR, err = reader.protonDrive.getSignatureVerificationKeyring(reader.ctx, []string{reader.link.SignatureEmail}, reader.nodeKR)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -107,7 +107,7 @@ func (protonDrive *ProtonDrive) DownloadFile(ctx context.Context, link *proton.L
+ 		return nil, 0, nil, err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 	if err != nil {
+ 		return nil, 0, nil, err
+ 	}
+diff --git a/file_upload.go b/file_upload.go
+index d13e073..835b1b7 100644
+--- a/file_upload.go
++++ b/file_upload.go
+@@ -120,7 +120,7 @@ func (protonDrive *ProtonDrive) createFileUploadDraft(ctx context.Context, paren
+ 		Encryption: parent link's node key
+ 		Signature: parent link's node key
+ 	*/
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{parentLink.SignatureEmail}, parentNodeKR)
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{parentLink.SignatureEmail}, parentNodeKR)
+ 	if err != nil {
+ 		return "", "", nil, nil, err
+ 	}
+@@ -222,7 +222,7 @@ func (protonDrive *ProtonDrive) createFileUploadDraft(ctx context.Context, paren
+ 		if err != nil {
+ 			return "", "", nil, nil, err
+ 		}
+-		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 		if err != nil {
+ 			return "", "", nil, nil, err
+ 		}
+diff --git a/folder.go b/folder.go
+index 33355ba..3cb318f 100644
+--- a/folder.go
++++ b/folder.go
+@@ -4,6 +4,7 @@ import (
+ 	"context"
+ 	"time"
+ 
++	"github.com/ProtonMail/gopenpgp/v2/crypto"
+ 	"github.com/rclone/go-proton-api"
+ )
+ 
+@@ -30,11 +31,16 @@ func (protonDrive *ProtonDrive) ListDirectory(
+ 		}
+ 
+ 		if childrenLinks != nil {
+-			folderParentKR, err := protonDrive.getLinkKRByID(ctx, folderLink.ParentLinkID)
+-			if err != nil {
+-				return nil, err
++			var folderParentKR *crypto.KeyRing
++			if protonDrive.isShareRootLink(folderLink) {
++				folderParentKR = protonDrive.MainShareKR
++			} else {
++				folderParentKR, err = protonDrive.getLinkKRByID(ctx, folderLink.ParentLinkID)
++				if err != nil {
++					return nil, err
++				}
+ 			}
+-			signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{folderLink.SignatureEmail})
++			signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{folderLink.SignatureEmail})
+ 			if err != nil {
+ 				return nil, err
+ 			}
+@@ -48,7 +54,7 @@ func (protonDrive *ProtonDrive) ListDirectory(
+ 					continue
+ 				}
+ 
+-				signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{childrenLinks[i].NameSignatureEmail, childrenLinks[i].SignatureEmail})
++				signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{childrenLinks[i].NameSignatureEmail, childrenLinks[i].SignatureEmail})
+ 				if err != nil {
+ 					return nil, err
+ 				}
+@@ -112,7 +118,7 @@ func (protonDrive *ProtonDrive) CreateNewFolder(ctx context.Context, parentLink
+ 		return "", err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{parentLink.SignatureEmail}, parentNodeKR)
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{parentLink.SignatureEmail}, parentNodeKR)
+ 	if err != nil {
+ 		return "", err
+ 	}
+@@ -217,7 +223,7 @@ func (protonDrive *ProtonDrive) moveLink(ctx context.Context, srcLink *proton.Li
+ 		return err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{dstParentLink.SignatureEmail}, dstParentKR)
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{dstParentLink.SignatureEmail}, dstParentKR)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/folder_recursive.go b/folder_recursive.go
+index 7ce4132..6cd571b 100644
+--- a/folder_recursive.go
++++ b/folder_recursive.go
+@@ -30,7 +30,7 @@ func (protonDrive *ProtonDrive) listDirectoriesRecursively(
+ 	var currentPath = ""
+ 
+ 	if !excludeRoot || curDepth != 0 {
+-		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.NameSignatureEmail, link.SignatureEmail})
++		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.NameSignatureEmail, link.SignatureEmail})
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -92,7 +92,7 @@ func (protonDrive *ProtonDrive) listDirectoriesRecursively(
+ 
+ 			if childrenLinks != nil {
+ 				// get current node's keyring
+-				signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++				signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 				if err != nil {
+ 					return err
+ 				}
+diff --git a/go.mod b/go.mod
+index 006a43c..125e0b9 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,6 +4,8 @@ go 1.22.0
+ 
+ toolchain go1.23.5
+ 
++replace github.com/rclone/go-proton-api => ../go-proton-api
++
+ require (
+ 	github.com/ProtonMail/gluon v0.17.1-0.20230724134000-308be39be96e
+ 	github.com/ProtonMail/gopenpgp/v2 v2.8.2
+diff --git a/search.go b/search.go
+index a3560cc..1bc2db8 100644
+--- a/search.go
++++ b/search.go
+@@ -51,7 +51,7 @@ func (protonDrive *ProtonDrive) SearchByNameInActiveFolder(
+ 		return nil, err
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{folderLink.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{folderLink.SignatureEmail})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -60,7 +60,7 @@ func (protonDrive *ProtonDrive) SearchByNameInActiveFolder(
+ 		return nil, err
+ 	}
+ 
+-	signatureVerificationKR, err = protonDrive.getSignatureVerificationKeyring([]string{folderLink.SignatureEmail}, folderLinkKR)
++	signatureVerificationKR, err = protonDrive.getSignatureVerificationKeyring(ctx, []string{folderLink.SignatureEmail}, folderLinkKR)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/search_recursive.go b/search_recursive.go
+index d36acbf..54ee015 100644
+--- a/search_recursive.go
++++ b/search_recursive.go
+@@ -73,7 +73,7 @@ func (protonDrive *ProtonDrive) performSearchByNameRecursively(
+ 		return nil, nil
+ 	}
+ 
+-	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.NameSignatureEmail, link.SignatureEmail})
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.NameSignatureEmail, link.SignatureEmail})
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -94,7 +94,7 @@ func (protonDrive *ProtonDrive) performSearchByNameRecursively(
+ 		// log.Printf("childrenLinks len = %v, %#v", len(childrenLinks), childrenLinks)
+ 
+ 		// get current node's keyring
+-		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring([]string{link.SignatureEmail})
++		signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.SignatureEmail})
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/shares.go b/shares.go
+index c366cf6..0e408f5 100644
+--- a/shares.go
++++ b/shares.go
+@@ -2,10 +2,21 @@ package proton_api_bridge
+ 
+ import (
+ 	"context"
++	"fmt"
+ 
++	"github.com/ProtonMail/gopenpgp/v2/crypto"
+ 	"github.com/rclone/go-proton-api"
+ )
+ 
++type SharedWithMeItem struct {
++	VolumeID string
++	ShareID  string
++	LinkID   string
++	Name     string
++	IsFolder bool
++	Link     *proton.Link
++}
++
+ func getAllShares(ctx context.Context, c *proton.Client) ([]proton.ShareMetadata, error) {
+ 	shares, err := c.ListShares(ctx, true)
+ 	if err != nil {
+@@ -23,3 +34,165 @@ func getShareByID(ctx context.Context, c *proton.Client, shareID string) (*proto
+ 
+ 	return &share, nil
+ }
++
++func isSupportedSharedWithMeTarget(target *proton.ShareTargetType) bool {
++	if target == nil {
++		return true
++	}
++
++	return *target == proton.ShareTargetTypeFolder ||
++		*target == proton.ShareTargetTypeFile ||
++		*target == proton.ShareTargetTypeProtonVendor
++}
++
++func (protonDrive *ProtonDrive) getShareKR(ctx context.Context, share *proton.Share) (*crypto.KeyRing, error) {
++	addrKR := protonDrive.DefaultAddrKR
++	if share.AddressID != "" {
++		if kr, ok := protonDrive.addrKRs[share.AddressID]; ok {
++			addrKR = kr
++		}
++	}
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{share.Creator}, addrKR)
++	if err != nil {
++		return nil, err
++	}
++	return share.GetKeyRing(addrKR, signatureVerificationKR)
++}
++
++func (protonDrive *ProtonDrive) isShareRootLink(link *proton.Link) bool {
++	if link == nil {
++		return false
++	}
++	if link.LinkID == protonDrive.RootLink.LinkID || link.LinkID == protonDrive.MainShare.LinkID || link.ParentLinkID == "" {
++		return true
++	}
++	return false
++}
++
++func (protonDrive *ProtonDrive) sharedLinkParentKR(ctx context.Context, share *proton.Share, link *proton.Link, shareKR *crypto.KeyRing) (*crypto.KeyRing, error) {
++	if link.LinkID == share.LinkID || link.ParentLinkID == "" {
++		return shareKR, nil
++	}
++
++	parentLink, err := protonDrive.c.GetLink(ctx, share.ShareID, link.ParentLinkID)
++	if err != nil {
++		return nil, fmt.Errorf("get shared parent link %s in share %s: %w", link.ParentLinkID, share.ShareID, err)
++	}
++
++	parentKR, err := protonDrive.sharedLinkParentKR(ctx, share, &parentLink, shareKR)
++	if err != nil {
++		return nil, fmt.Errorf("get shared parent keyring for link %s in share %s: %w", parentLink.LinkID, share.ShareID, err)
++	}
++
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{parentLink.SignatureEmail}, parentKR)
++	if err != nil {
++		return nil, fmt.Errorf("get shared parent signature keyring for link %s signature email %q: %w", parentLink.LinkID, parentLink.SignatureEmail, err)
++	}
++	parentLinkKR, err := parentLink.GetKeyRing(parentKR, signatureVerificationKR)
++	if err != nil {
++		return nil, fmt.Errorf("decrypt shared parent link keyring for link %s signature email %q: %w", parentLink.LinkID, parentLink.SignatureEmail, err)
++	}
++	return parentLinkKR, nil
++}
++
++func (protonDrive *ProtonDrive) sharedLinkName(ctx context.Context, share *proton.Share, link *proton.Link, shareKR *crypto.KeyRing) (string, error) {
++	parentKR, err := protonDrive.sharedLinkParentKR(ctx, share, link, shareKR)
++	if err != nil {
++		return "", fmt.Errorf("get shared link parent keyring for link %s in share %s: %w", link.LinkID, share.ShareID, err)
++	}
++
++	signatureVerificationKR, err := protonDrive.getSignatureVerificationKeyring(ctx, []string{link.NameSignatureEmail, link.SignatureEmail}, parentKR)
++	if err != nil {
++		return "", fmt.Errorf("get shared link name signature keyring for link %s name email %q signature email %q: %w", link.LinkID, link.NameSignatureEmail, link.SignatureEmail, err)
++	}
++	name, err := link.GetName(parentKR, signatureVerificationKR)
++	if err != nil {
++		return "", fmt.Errorf("decrypt shared link name for link %s name email %q signature email %q: %w", link.LinkID, link.NameSignatureEmail, link.SignatureEmail, err)
++	}
++	return name, nil
++}
++
++func (protonDrive *ProtonDrive) ListSharedWithMe(ctx context.Context) ([]*SharedWithMeItem, error) {
++	var ret []*SharedWithMeItem
++	anchorID := ""
++
++	for {
++		links, nextAnchorID, more, err := protonDrive.c.ListSharedWithMe(ctx, anchorID)
++		if err != nil {
++			return nil, err
++		}
++
++		for i := range links {
++			if !isSupportedSharedWithMeTarget(links[i].ShareTargetType) {
++				continue
++			}
++
++			share, err := getShareByID(ctx, protonDrive.c, links[i].ShareID)
++			if err != nil {
++				return nil, fmt.Errorf("get shared-with-me share %s: %w", links[i].ShareID, err)
++			}
++
++			link, err := protonDrive.c.GetLink(ctx, links[i].ShareID, links[i].LinkID)
++			if err != nil {
++				return nil, fmt.Errorf("get shared-with-me link %s in share %s: %w", links[i].LinkID, links[i].ShareID, err)
++			}
++
++			shareKR, err := protonDrive.getShareKR(ctx, share)
++			if err != nil {
++				return nil, fmt.Errorf("decrypt shared-with-me share keyring %s: %w", links[i].ShareID, err)
++			}
++
++			name, err := protonDrive.sharedLinkName(ctx, share, &link, shareKR)
++			if err != nil {
++				return nil, fmt.Errorf("decrypt shared-with-me item name link %s share %s: %w", links[i].LinkID, links[i].ShareID, err)
++			}
++
++			ret = append(ret, &SharedWithMeItem{
++				VolumeID: links[i].VolumeID,
++				ShareID:  links[i].ShareID,
++				LinkID:   links[i].LinkID,
++				Name:     name,
++				IsFolder: link.Type == proton.LinkTypeFolder,
++				Link:     &link,
++			})
++		}
++
++		if !more || nextAnchorID == "" {
++			break
++		}
++		anchorID = nextAnchorID
++	}
++
++	return ret, nil
++}
++
++func (protonDrive *ProtonDrive) SwitchToShare(ctx context.Context, shareID, linkID string) error {
++	share, err := getShareByID(ctx, protonDrive.c, shareID)
++	if err != nil {
++		return err
++	}
++
++	rootLink, err := protonDrive.c.GetLink(ctx, share.ShareID, linkID)
++	if err != nil {
++		return err
++	}
++
++	shareKR, err := protonDrive.getShareKR(ctx, share)
++	if err != nil {
++		return err
++	}
++
++	protonDrive.MainShare = share
++	protonDrive.RootLink = &rootLink
++	protonDrive.MainShareKR = shareKR
++	if share.AddressID != "" {
++		if kr, ok := protonDrive.addrKRs[share.AddressID]; ok {
++			protonDrive.DefaultAddrKR = kr
++		}
++	}
++	// Keep the authenticated user's active address for new signatures.
++	// share.Creator belongs to the owner and is only valid for verification.
++	protonDrive.cache = newCache(protonDrive.Config.EnableCaching, protonDrive.Config.GetLogger())
++
++	return nil
++}

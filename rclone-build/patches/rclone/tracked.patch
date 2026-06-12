@@ -1,0 +1,110 @@
+diff --git a/backend/protondrive/protondrive.go b/backend/protondrive/protondrive.go
+index 502ca7c..df422bf 100644
+--- a/backend/protondrive/protondrive.go
++++ b/backend/protondrive/protondrive.go
+@@ -199,6 +199,20 @@ cache. Thus, if there are concurrent clients accessing the same mount point,
+ then we might have a problem with caching the stale data.`,
+ 			Advanced: true,
+ 			Default:  true,
++		}, {
++			Name: "shared_with_me",
++			Help: `Use a Proton Drive item shared with this account as the remote root
++
++When enabled, the first path component selects a top-level item from Proton
++Drive's "Shared with me" list. For example:
++
++    protondrive,shared_with_me:MySharedFolder
++
++selects the shared item named "MySharedFolder" and exposes its contents as the
++remote root. The initial implementation is intended for one selected shared
++file or folder, not for listing a virtual "Shared with me" root.`,
++			Advanced: true,
++			Default:  false,
+ 		}},
+ 	})
+ }
+@@ -217,6 +231,7 @@ type Options struct {
+ 	AppVersion           string               `config:"app_version"`
+ 	ReplaceExistingDraft bool                 `config:"replace_existing_draft"`
+ 	EnableCaching        bool                 `config:"enable_caching"`
++	SharedWithMe         bool                 `config:"shared_with_me"`
+ }
+ 
+ // Fs represents a remote proton drive
+@@ -505,6 +520,34 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
+ 	return protonDrive, nil
+ }
+ 
++func selectSharedWithMeRoot(ctx context.Context, f *Fs, protonDrive *protonDriveAPI.ProtonDrive, root string) (string, error) {
++	if root == "" {
++		return "", fmt.Errorf("shared_with_me requires a path starting with a shared item name")
++	}
++
++	sharedRootName, remainingRoot, _ := strings.Cut(root, "/")
++	sharedItems, err := protonDrive.ListSharedWithMe(ctx)
++	if err != nil {
++		return "", err
++	}
++
++	for _, item := range sharedItems {
++		if f.opt.Enc.ToStandardName(item.Name) != sharedRootName {
++			continue
++		}
++		if !item.IsFolder && remainingRoot != "" {
++			return "", fmt.Errorf("shared item %q is not a folder", sharedRootName)
++		}
++		if err := protonDrive.SwitchToShare(ctx, item.ShareID, item.LinkID); err != nil {
++			return "", err
++		}
++		fs.Debugf(f, "Selected shared-with-me item %q (share %s, link %s)", item.Name, item.ShareID, item.LinkID)
++		return remainingRoot, nil
++	}
++
++	return "", fs.ErrorDirNotFound
++}
++
+ // NewFs constructs an Fs from the path, container:path
+ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
+ 	// pacer is not used in NewFs()
+@@ -569,6 +612,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
+ 	}
+ 	f.protonDrive = protonDrive
+ 
++	if opt.SharedWithMe {
++		root, err = selectSharedWithMeRoot(ctx, f, protonDrive, root)
++		if err != nil {
++			return nil, err
++		}
++		f.root = root
++	}
++
+ 	root = f.sanitizePath(root)
+ 	f.dirCache = dircache.New(
+ 		root,                         /* root folder path */
+diff --git a/cmd/all/all.go b/cmd/all/all.go
+index 912cde6..886e823 100644
+--- a/cmd/all/all.go
++++ b/cmd/all/all.go
+@@ -49,6 +49,7 @@ import (
+ 	_ "github.com/rclone/rclone/cmd/ncdu"
+ 	_ "github.com/rclone/rclone/cmd/nfsmount"
+ 	_ "github.com/rclone/rclone/cmd/obscure"
++	_ "github.com/rclone/rclone/cmd/protonwatch"
+ 	_ "github.com/rclone/rclone/cmd/purge"
+ 	_ "github.com/rclone/rclone/cmd/rc"
+ 	_ "github.com/rclone/rclone/cmd/rcat"
+diff --git a/go.mod b/go.mod
+index c04acc2..9d1a045 100644
+--- a/go.mod
++++ b/go.mod
+@@ -4,6 +4,10 @@ go 1.25.0
+ 
+ godebug x509negativeserial=1
+ 
++replace github.com/rclone/Proton-API-Bridge => ../proton-api-bridge
++
++replace github.com/rclone/go-proton-api => ../go-proton-api
++
+ require (
+ 	bazil.org/fuse v0.0.0-20230120002735-62a210ff1fd5
+ 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.21.0

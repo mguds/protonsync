@@ -1,0 +1,30 @@
+protonsync
+==========
+
+This project builds on, and distributes a patched build of, the following
+MIT-licensed open-source projects. Their copyright and license terms continue
+to apply to the corresponding code.
+
+1. rclone
+   https://github.com/rclone/rclone
+   Copyright (C) The rclone Authors
+   Licensed under the MIT License.
+
+2. Proton-API-Bridge
+   https://github.com/rclone/Proton-API-Bridge
+   Licensed under the MIT License.
+
+3. go-proton-api
+   https://github.com/rclone/go-proton-api
+   Licensed under the MIT License.
+
+The patches under rclone-build/patches/ are modifications to the projects above
+and are released under the MIT License (see LICENSE). The prebuilt
+`protonsync-rclone` binary distributed via GitHub Releases is a compiled
+derivative work of the three projects above and is likewise covered by their
+MIT licenses.
+
+protonsync is an unofficial, community integration. It is not affiliated with,
+endorsed by, or supported by Proton AG or the rclone project. "Proton" and
+"Proton Drive" are trademarks of their respective owners and are used here only
+to describe interoperability.

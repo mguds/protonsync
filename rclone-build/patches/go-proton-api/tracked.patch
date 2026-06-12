@@ -1,0 +1,92 @@
+diff --git a/link_types.go b/link_types.go
+index e58d054..6ad0cea 100644
+--- a/link_types.go
++++ b/link_types.go
+@@ -38,6 +38,11 @@ type Link struct {
+ 
+ 	FileProperties   *FileProperties
+ 	FolderProperties *FolderProperties
++	SharingDetails   *LinkSharingDetails
++}
++
++type LinkSharingDetails struct {
++	ShareID string
+ }
+ 
+ type LinkState int
+diff --git a/share.go b/share.go
+index 11bbb6e..8cd9530 100644
+--- a/share.go
++++ b/share.go
+@@ -37,3 +37,23 @@ func (c *Client) GetShare(ctx context.Context, shareID string) (Share, error) {
+ 
+ 	return res.Share, nil
+ }
++
++func (c *Client) ListSharedWithMe(ctx context.Context, anchorID string) ([]SharedWithMeItem, string, bool, error) {
++	var res struct {
++		Links    []SharedWithMeItem
++		AnchorID string
++		More     bool
++	}
++
++	if err := c.do(ctx, func(r *resty.Request) (*resty.Response, error) {
++		if anchorID != "" {
++			r.SetQueryParam("AnchorID", anchorID)
++		}
++
++		return r.SetResult(&res).Get("/drive/v2/sharedwithme")
++	}); err != nil {
++		return nil, "", false, err
++	}
++
++	return res.Links, res.AnchorID, res.More, nil
++}
+diff --git a/share_types.go b/share_types.go
+index 6966c13..a24762e 100644
+--- a/share_types.go
++++ b/share_types.go
+@@ -35,7 +35,7 @@ type Share struct {
+ 	PassphraseSignature string // The signature of the passphrase
+ }
+ 
+-func (s Share) GetKeyRing(addrKR *crypto.KeyRing) (*crypto.KeyRing, error) {
++func (s Share) GetKeyRing(addrKR *crypto.KeyRing, verificationKRs ...*crypto.KeyRing) (*crypto.KeyRing, error) {
+ 	enc, err := crypto.NewPGPMessageFromArmored(s.Passphrase)
+ 	if err != nil {
+ 		return nil, err
+@@ -51,7 +51,11 @@ func (s Share) GetKeyRing(addrKR *crypto.KeyRing) (*crypto.KeyRing, error) {
+ 		return nil, err
+ 	}
+ 
+-	if err := addrKR.VerifyDetached(dec, sig, crypto.GetUnixTime()); err != nil {
++	verificationKR := addrKR
++	if len(verificationKRs) > 0 && verificationKRs[0] != nil {
++		verificationKR = verificationKRs[0]
++	}
++	if err := verificationKR.VerifyDetached(dec, sig, crypto.GetUnixTime()); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -89,3 +93,21 @@ const (
+ 	NoFlags ShareFlags = iota
+ 	PrimaryShare
+ )
++
++type ShareTargetType int
++
++const (
++	ShareTargetTypeRoot ShareTargetType = iota
++	ShareTargetTypeFolder
++	ShareTargetTypeFile
++	ShareTargetTypeAlbum
++	ShareTargetTypePhoto
++	ShareTargetTypeProtonVendor
++)
++
++type SharedWithMeItem struct {
++	VolumeID        string
++	ShareID         string
++	LinkID          string
++	ShareTargetType *ShareTargetType
++}
