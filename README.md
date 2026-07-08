@@ -26,14 +26,15 @@ protonsync runs two lightweight, always-on services per user:
    command reads Proton Drive's change-event stream and downloads only the items
    that actually changed (default poll: every 15 seconds).
 
-A full two-way `bisync` is used **only** for:
+A full two-way `bisync` is used **only** for the **initial download** of the
+whole shared folder on first install; the installer then masks the bisync
+services. After that recovery is event-based and self-healing: a single event
+that cannot be applied is skipped and logged, and a broken or expired event
+stream is re-anchored in place (fresh index from "now") with backoff — no full
+sync is ever run automatically again.
 
-- the **initial download** of the whole shared folder on first install, and
-- **automatic repair** when something concrete goes wrong: a conflicting
-  change, an expired event stream, or lost `inotify` events.
-
-There is **no** periodic full sync by default. A scheduled audit sync is
-available as an opt-in (`AUDIT_MODE=1`), disabled by default.
+There is **no** periodic full sync. A scheduled audit sync is available as an
+opt-in (`AUDIT_MODE=1`), disabled by default.
 
 ## ⚠️ Concurrent editing
 
@@ -109,9 +110,10 @@ tail -f ~/.local/state/protonsync-event-watch.log
 Files deleted via a remote event are first moved to a dated recovery folder at
 `~/.local/state/protonsync-recovery/` rather than being removed immediately.
 
-Trigger a manual full sync / repair:
+Trigger a manual full sync / repair (the bisync service is masked by default):
 
 ```bash
+systemctl --user unmask protonsync-bisync.service
 systemctl --user start protonsync-bisync.service
 ```
 

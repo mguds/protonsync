@@ -76,6 +76,8 @@ def ignored(relative_path: Path) -> bool:
             return True
         if part.startswith("~$"):
             return True
+        if part.endswith((".partial", ".tmp")):
+            return True
     return False
 
 
@@ -276,18 +278,23 @@ class UploadWatcher:
             return None
 
     def run_rclone(
-        self, command: list[str], relative: str, action: str = "Uploading"
-    ) -> None:
+        self,
+        command: list[str],
+        relative: str,
+        action: str = "Uploading",
+        success_codes: tuple[int, ...] = (0,),
+    ) -> int:
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
         with self.lock_file.open("a+") as lock:
             logging.info("Waiting for sync lock: %s", relative)
             fcntl.flock(lock, fcntl.LOCK_EX)
             logging.info("%s local change: %s", action, relative)
             result = subprocess.run(command, check=False)
-            if result.returncode:
+            if result.returncode not in success_codes:
                 raise RuntimeError(
                     f"rclone failed with exit code {result.returncode}: {relative}"
                 )
+            return result.returncode
 
     def upload(self, relative: str, is_dir: bool) -> bool:
         local_path = self.root / Path(relative)
@@ -353,7 +360,14 @@ class UploadWatcher:
             self.remote_path(relative),
             *common,
         ]
-        self.run_rclone(command, relative, action="Deleting")
+        # rclone exits 3 (directory not found) or 4 (file not found) when the
+        # remote path is already gone. For a delete that is the desired end
+        # state, not a failure to retry forever, so accept those codes.
+        code = self.run_rclone(
+            command, relative, action="Deleting", success_codes=(0, 3, 4)
+        )
+        if code:
+            logging.info("Remote path already absent; delete satisfied: %s", relative)
         return True
 
     def process_pending(self) -> None:

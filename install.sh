@@ -10,6 +10,13 @@ set -euo pipefail
 #   SHARE_NAME   Name of the shared item as it appears under Proton Drive
 #                "Shared with me" (e.g. SHARE_NAME="Team Files").
 #
+# Owner mode (for the account that OWNS the folder):
+#   OWNER_MODE=1 Sync a folder that lives under YOUR OWN "My files" in Proton
+#                Drive instead of one shared with you. SHARE_NAME is then the
+#                folder name under "My files" (e.g. the person who shared the
+#                folder with everyone else runs: SHARE_NAME="Team Files"
+#                OWNER_MODE=1 ./install.sh).
+#
 # Common optional settings (see README.md for the full list):
 #   LOCAL_DIR              Local target folder (default: ~/Proton Drive/$SHARE_NAME)
 #   REMOTE_NAME            rclone remote name (default: protondrive)
@@ -26,6 +33,7 @@ UPLOAD_DEBOUNCE="${UPLOAD_DEBOUNCE:-5}"
 EVENT_POLL_INTERVAL="${EVENT_POLL_INTERVAL:-15s}"
 AUDIT_MODE="${AUDIT_MODE:-0}"
 AUDIT_CALENDAR="${AUDIT_CALENDAR:-Sun *-*-* 08:00:00}"
+OWNER_MODE="${OWNER_MODE:-0}"
 
 if [[ -z "$SHARE_NAME" ]]; then
     cat >&2 <<'MSG'
@@ -41,7 +49,12 @@ MSG
 fi
 
 LOCAL_DIR="${LOCAL_DIR:-$HOME/Proton Drive/$SHARE_NAME}"
-REMOTE_DIR="${REMOTE_NAME},shared_with_me=true:${SHARE_NAME}"
+if [[ "$OWNER_MODE" == "1" ]]; then
+    # The folder lives under this account's own "My files" root.
+    REMOTE_DIR="${REMOTE_NAME}:${SHARE_NAME}"
+else
+    REMOTE_DIR="${REMOTE_NAME},shared_with_me=true:${SHARE_NAME}"
+fi
 PROTON_DIR="$HOME/Proton Drive"
 PROTON_BOOKMARK="file://${PROTON_DIR// /%20} Proton Drive"
 
@@ -155,10 +168,14 @@ if [[ ! -e "$WORK_DIR" ]] && find "$LOCAL_DIR" -mindepth 1 -print -quit | grep -
     exit 4
 fi
 
-echo "Checking access to the shared Proton folder '$SHARE_NAME'..."
+echo "Checking access to the Proton folder '$SHARE_NAME'..."
 if ! "$RCLONE" lsf "$REMOTE_DIR" --max-depth 1 >/dev/null; then
     echo "Could not access: $REMOTE_DIR" >&2
-    echo "Make sure '$SHARE_NAME' is visible under your Proton 'Shared with me'." >&2
+    if [[ "$OWNER_MODE" == "1" ]]; then
+        echo "Make sure the folder '$SHARE_NAME' exists under 'My files' in your Proton Drive." >&2
+    else
+        echo "Make sure '$SHARE_NAME' is visible under your Proton 'Shared with me'." >&2
+    fi
     exit 3
 fi
 
@@ -176,6 +193,10 @@ if [[ ! -f "$FILTER_FILE" ]] || \
 - **/~$*
 - **/.DS_Store
 - **/Thumbs.db
+# If a file in the shared folder fails Proton PGP signature verification
+# ("signature made by unknown entity", typically uploaded by another member)
+# and aborts the initial bisync, exclude it here ("- /path/to/file") and
+# restart the bisync. The event watchers skip such files on their own.
 FILTER
 fi
 
@@ -296,6 +317,9 @@ LOG_FILE="$EVENT_LOG_FILE"
 
 mkdir -p "\$(dirname "\$STATE_FILE")" "\$(dirname "\$LOCK_FILE")" "\$(dirname "\$LOG_FILE")"
 
+FALLBACK_COUNT=0
+LAST_FALLBACK=0
+
 while true; do
     rm -f "\$FALLBACK_MARKER"
     "\$RCLONE" protonwatch "\$REMOTE_DIR" "\$LOCAL_DIR" \
@@ -311,19 +335,30 @@ while true; do
     status=\$?
 
     if [[ -e "\$FALLBACK_MARKER" ]]; then
-        printf '%s Event watcher requested full bisync (status %s).\\n' \
+        # Recover WITHOUT a full bisync: drop the event anchor so the next run
+        # rebuilds the index from the current latest event, skipping whatever
+        # event could not be applied. The upload queue and dirty/suppress
+        # markers are left intact so pending local changes are never lost.
+        printf '%s Event watcher could not continue (status %s); re-anchoring event stream without bisync.\\n' \
             "\$(date --iso-8601=seconds)" "\$status" >>"\$LOG_FILE"
-        systemctl --user stop protonsync-upload-watch.service >>"\$LOG_FILE" 2>&1 || true
-        if systemctl --user start protonsync-bisync.service >>"\$LOG_FILE" 2>&1; then
-            rm -f "\$STATE_FILE" "\$FALLBACK_MARKER" "\$UPLOAD_QUEUE_FILE"
-            rm -f "\$DIRTY_DIR"/*.json "\$SUPPRESS_DIR"/*.json 2>/dev/null || true
+        rm -f "\$STATE_FILE" "\$FALLBACK_MARKER"
+        now=\$(date +%s)
+        if (( now - LAST_FALLBACK < 1800 )); then
+            FALLBACK_COUNT=\$(( FALLBACK_COUNT + 1 ))
+        else
+            FALLBACK_COUNT=1
         fi
-        systemctl --user start protonsync-upload-watch.service >>"\$LOG_FILE" 2>&1 || true
+        LAST_FALLBACK=\$now
+        # Back off if re-anchoring keeps happening, so a persistently broken
+        # event can never pin the CPU with back-to-back re-indexes.
+        backoff=\$(( FALLBACK_COUNT * 60 ))
+        (( backoff > 900 )) && backoff=900
+        sleep "\$backoff"
     else
         printf '%s Event watcher stopped unexpectedly (status %s).\\n' \
             "\$(date --iso-8601=seconds)" "\$status" >>"\$LOG_FILE"
+        sleep 10
     fi
-    sleep 10
 done
 SCRIPT
 chmod 0755 "$EVENT_SCRIPT"
@@ -561,6 +596,10 @@ done
 systemctl --user disable --now protonsync-upload-watch.service 2>/dev/null || true
 systemctl --user disable --now protonsync-event-watch.service 2>/dev/null || true
 echo "Performing the initial full download of '$SHARE_NAME' before enabling monitoring..."
+# Unmask first in case a previous run masked these (see below), so the one-time
+# initial bisync can still run when install.sh is re-run.
+systemctl --user unmask protonsync-bisync.service protonsync-reconcile.service >/dev/null 2>&1 || true
+systemctl --user daemon-reload
 systemctl --user start protonsync-bisync.service
 systemctl --user enable --now protonsync-upload-watch.service
 systemctl --user enable --now protonsync-event-watch.service
@@ -569,6 +608,17 @@ if [[ "$AUDIT_MODE" == "1" ]]; then
     systemctl --user enable --now protonsync-bisync.timer
 else
     systemctl --user disable --now protonsync-bisync.timer 2>/dev/null || true
+fi
+
+# The one-time initial download above is done. From here the sync is purely
+# event-driven: the event watcher recovers by re-anchoring the event stream
+# (never a full bisync), so the reconcile-via-bisync path is redundant. Mask
+# both bisync units so nothing — reconcile trigger, timer, or manual start —
+# can launch a full bisync again. To run a full repair later, unmask first:
+#   systemctl --user unmask protonsync-bisync.service && \
+#       systemctl --user start protonsync-bisync.service
+if [[ "$AUDIT_MODE" != "1" ]]; then
+    systemctl --user mask protonsync-bisync.service protonsync-reconcile.service >/dev/null 2>&1 || true
 fi
 
 for bookmarks_file in \
@@ -582,14 +632,18 @@ done
 
 echo
 echo "Installation complete."
-echo "Shared folder:        $SHARE_NAME"
+if [[ "$OWNER_MODE" == "1" ]]; then
+    echo "Folder (My files):    $SHARE_NAME  (owner mode)"
+else
+    echo "Shared folder:        $SHARE_NAME"
+fi
 echo "Local folder:         $LOCAL_DIR"
 echo "Local upload delay:   about $UPLOAD_DEBOUNCE seconds"
 echo "Event poll interval:  $EVENT_POLL_INTERVAL"
 if [[ "$AUDIT_MODE" == "1" ]]; then
     echo "Scheduled audit:      enabled ($AUDIT_CALENDAR)"
 else
-    echo "Scheduled audit:      disabled (fast sync + on-demand repair only)"
+    echo "Scheduled audit:      disabled (event-driven sync only; full bisync masked)"
 fi
 echo "Status command:       $STATUS_SCRIPT"
 echo "Recovery copies:      $RECOVERY_DIR"

@@ -253,6 +253,27 @@ func (w *eventWatcher) buildIndex(ctx context.Context) error {
 	})
 }
 
+// reindex rebuilds the link index and re-anchors the event cursor at the
+// current latest event. It is used both for the first run and to self-heal an
+// expired Proton event stream ("refresh") in place, without a full bisync.
+func (w *eventWatcher) reindex(ctx context.Context) error {
+	eventID, err := w.source.LatestEventID(ctx)
+	if err != nil {
+		return fmt.Errorf("get latest Proton event ID: %w", err)
+	}
+	fs.Logf(w.fsrc, "Building Proton event link index")
+	if err := w.buildIndex(ctx); err != nil {
+		return fmt.Errorf("build Proton event link index: %w", err)
+	}
+	w.state.Remote = w.remoteIdentity
+	w.state.EventID = eventID
+	if err := w.saveState(); err != nil {
+		return fmt.Errorf("save Proton event state: %w", err)
+	}
+	fs.Logf(w.fsrc, "Proton event index ready with %d items", len(w.state.Items))
+	return nil
+}
+
 func (w *eventWatcher) initialize(ctx context.Context) error {
 	if err := w.loadState(); err != nil {
 		return w.requestFallback(fmt.Errorf("load Proton event state: %w", err))
@@ -260,21 +281,9 @@ func (w *eventWatcher) initialize(ctx context.Context) error {
 	if w.state.EventID != "" {
 		return nil
 	}
-
-	eventID, err := w.source.LatestEventID(ctx)
-	if err != nil {
-		return w.requestFallback(fmt.Errorf("get initial Proton event ID: %w", err))
+	if err := w.reindex(ctx); err != nil {
+		return w.requestFallback(err)
 	}
-	fs.Logf(w.fsrc, "Building initial Proton event link index")
-	if err := w.buildIndex(ctx); err != nil {
-		return w.requestFallback(fmt.Errorf("build Proton event link index: %w", err))
-	}
-	w.state.Remote = w.remoteIdentity
-	w.state.EventID = eventID
-	if err := w.saveState(); err != nil {
-		return w.requestFallback(fmt.Errorf("save initial Proton event state: %w", err))
-	}
-	fs.Logf(w.fsrc, "Proton event watcher initialized with %d indexed items", len(w.state.Items))
 	return nil
 }
 
@@ -360,7 +369,12 @@ func (w *eventWatcher) applyChange(ctx context.Context, change protondrive.Event
 	}
 	if change.IsDeleted {
 		if !existed {
-			return fmt.Errorf("delete event for unknown link ID %s", change.LinkID)
+			// The item was never indexed locally (created and deleted
+			// remotely between polls, or filtered out). There is nothing to
+			// remove, so treat the delete as a no-op rather than wedging the
+			// whole event stream.
+			fs.Logf(w.fsrc, "Ignoring delete for unindexed Proton link %s", change.LinkID)
+			return nil
 		}
 		localPath, err := w.localPath(oldItem.Path)
 		if err != nil {
@@ -451,10 +465,22 @@ func (w *eventWatcher) withLock(fn func() error) error {
 func (w *eventWatcher) poll(ctx context.Context) error {
 	batch, err := w.source.PollEvents(ctx, w.state.EventID)
 	if err != nil {
-		return w.requestFallback(fmt.Errorf("poll Proton events: %w", err))
+		// A failed poll (network blip, transient API error) is recoverable:
+		// log it and retry on the next tick instead of exiting the process or
+		// forcing a full bisync.
+		fs.Logf(w.fsrc, "Proton event poll failed; will retry: %v", err)
+		w.writeHealth("degraded", fmt.Sprintf("event poll failed; retrying: %v", err))
+		return nil
 	}
 	if batch.Refresh || batch.EventID == "" {
-		return w.requestFallback(errors.New("Proton event stream requires a full bisync refresh"))
+		// Proton's event cursor expired. Rebuild the index and re-anchor at
+		// the latest event in place, rather than triggering a full bisync.
+		fs.Logf(w.fsrc, "Proton event stream expired; rebuilding index in place")
+		if err := w.withLock(func() error { return w.reindex(ctx) }); err != nil {
+			return w.requestFallback(fmt.Errorf("rebuild after Proton event refresh: %w", err))
+		}
+		w.writeHealth("ok", "rebuilt index after Proton event refresh")
+		return nil
 	}
 	if len(batch.Changes) == 0 {
 		w.state.EventID = batch.EventID
@@ -465,19 +491,32 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		return nil
 	}
 
+	var skipped int
 	err = w.withLock(func() error {
 		for _, change := range batch.Changes {
-			if err := w.applyChange(ctx, change); err != nil {
-				return err
+			if applyErr := w.applyChange(ctx, change); applyErr != nil {
+				// A single unapplicable event (e.g. a file whose signature the
+				// library cannot verify, or one that conflicts with a pending
+				// local change) must never wedge the whole stream. Skip it,
+				// keep processing the rest, and still advance the cursor so the
+				// watcher makes forward progress.
+				skipped++
+				fs.Logf(w.fsrc, "Skipping Proton event for link %s: %v", change.LinkID, applyErr)
 			}
 		}
 		w.state.EventID = batch.EventID
 		return w.saveState()
 	})
 	if err != nil {
-		return w.requestFallback(fmt.Errorf("apply Proton events: %w", err))
+		// Only an inability to persist progress reaches here.
+		return w.requestFallback(fmt.Errorf("save Proton event state: %w", err))
 	}
-	w.writeHealth("ok", fmt.Sprintf("applied %d event(s)", len(batch.Changes)))
+	applied := len(batch.Changes) - skipped
+	if skipped > 0 {
+		w.writeHealth("degraded", fmt.Sprintf("applied %d event(s), skipped %d unapplicable", applied, skipped))
+	} else {
+		w.writeHealth("ok", fmt.Sprintf("applied %d event(s)", applied))
+	}
 	return nil
 }
 

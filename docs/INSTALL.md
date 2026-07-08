@@ -100,13 +100,16 @@ Both watchers should be **active** and the queue should drain to `0 pending`.
 protonsync-status
 journalctl --user -u protonsync-health.service --since today
 
-# Force a full sync / repair
+# Force a full sync / repair (the bisync service is masked by default)
+systemctl --user unmask protonsync-bisync.service
 systemctl --user start protonsync-bisync.service
 journalctl --user -fu protonsync-bisync.service
 ```
 
-If the event stream expires or local events are lost, protonsync automatically
-runs a one-off repair bisync — you do not need to schedule one.
+If the event stream expires or an event cannot be applied, protonsync recovers
+on its own: single bad events are skipped and logged, and a broken event stream
+is re-anchored in place (a fresh index from "now") with backoff. No full bisync
+is ever run automatically after the initial download.
 
 ## Uninstall
 

@@ -15,6 +15,11 @@ class UploadWatcherTests(unittest.TestCase):
         self.assertTrue(ignored(Path(".~partial.insyncdl")))
         self.assertFalse(ignored(Path("report.docx")))
 
+    def test_ignored_transfer_temporary_files(self):
+        self.assertTrue(ignored(Path("folder/movie.mp4.abcd1234.partial")))
+        self.assertTrue(ignored(Path("folder/data.csv.tmp")))
+        self.assertFalse(ignored(Path("folder/data.csv")))
+
     def test_suppression_requires_matching_operation(self):
         with tempfile.TemporaryDirectory() as directory:
             watcher = UploadWatcher.__new__(UploadWatcher)

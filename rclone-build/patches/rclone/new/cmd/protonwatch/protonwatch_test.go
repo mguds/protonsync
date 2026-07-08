@@ -1,10 +1,12 @@
 package protonwatch
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/rclone/rclone/backend/protondrive"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,6 +67,20 @@ func TestRemoveLocalDirectory(t *testing.T) {
 	matches, err := filepath.Glob(filepath.Join(recovery, "*", "folder", "file.txt"))
 	require.NoError(t, err)
 	require.Len(t, matches, 1)
+}
+
+func TestApplyChangeIgnoresUnknownDelete(t *testing.T) {
+	watcher := eventWatcher{
+		dirtyDir: t.TempDir(),
+		state:    watcherState{Items: map[string]indexedItem{}},
+	}
+	// A delete event for a link we never indexed must be a no-op, not a fatal
+	// error that wedges the whole event stream.
+	err := watcher.applyChange(context.Background(), protondrive.EventChange{
+		LinkID:    "missing",
+		IsDeleted: true,
+	})
+	require.NoError(t, err)
 }
 
 func TestPathsOverlap(t *testing.T) {
