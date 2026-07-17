@@ -82,6 +82,19 @@ co-editing, use a document/PDM system designed for it.
    download before the fast watchers start. Existing files are never silently
    overwritten — the installer stops if the target is non-empty.
 
+   **Sync everything instead of one folder?** Leave `SHARE_NAME` out:
+
+   ```bash
+   ./install.sh                # every folder under "Shared with me"
+   OWNER_MODE=1 ./install.sh   # your whole "My files" (owner account)
+   ```
+
+   Each shared folder gets its own local folder under `~/Proton Drive/` and its
+   own set of background services; single shared *files* are skipped. Folders
+   shared with you later are picked up by re-running `./install.sh`. An
+   existing one-folder install is converted — without re-downloading — with
+   `./convert-to-sync-all.sh`.
+
 Full walkthrough: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Configuration
@@ -90,8 +103,9 @@ Set these as environment variables before `./install.sh`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHARE_NAME` | _(required)_ | Name of the shared item under "Shared with me" |
-| `LOCAL_DIR` | `~/Proton Drive/$SHARE_NAME` | Local target folder |
+| `SHARE_NAME` | _(empty = sync everything)_ | Name of ONE shared item under "Shared with me"; leave empty to sync every shared folder (or all of "My files" with `OWNER_MODE=1`) |
+| `LOCAL_DIR` | `~/Proton Drive/$SHARE_NAME` | Local target folder (single-folder and owner-everything installs) |
+| `ALLOW_EXISTING` | `0` | `1` skips the empty-folder check (conversions; see `convert-to-sync-all.sh`) |
 | `REMOTE_NAME` | `protondrive` | rclone remote name |
 | `RCLONE_BINARY` | auto-detected | Path to `protonsync-rclone` |
 | `UPLOAD_DEBOUNCE` | `5` | Seconds before uploading a local change |

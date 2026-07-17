@@ -85,10 +85,11 @@ diff --git a/cmd/all/all.go b/cmd/all/all.go
 index 912cde6..886e823 100644
 --- a/cmd/all/all.go
 +++ b/cmd/all/all.go
-@@ -49,6 +49,7 @@ import (
+@@ -49,6 +49,8 @@ import (
  	_ "github.com/rclone/rclone/cmd/ncdu"
  	_ "github.com/rclone/rclone/cmd/nfsmount"
  	_ "github.com/rclone/rclone/cmd/obscure"
++	_ "github.com/rclone/rclone/cmd/protonshares"
 +	_ "github.com/rclone/rclone/cmd/protonwatch"
  	_ "github.com/rclone/rclone/cmd/purge"
  	_ "github.com/rclone/rclone/cmd/rc"
