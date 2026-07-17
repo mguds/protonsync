@@ -20,6 +20,9 @@ for unit_file in "$UNIT_DIR"/protonsync-*.timer "$UNIT_DIR"/protonsync-*.service
     rm -f "$unit_file"
 done
 
+# Parked real unit files from the mask-with-/dev/null technique.
+rm -f "$UNIT_DIR"/protonsync-*.service.locked
+
 rm -f \
     "$HOME/.local/bin/protonsync-rclone" \
     "$HOME/.local/bin"/protonsync-bisync* \

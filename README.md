@@ -106,6 +106,7 @@ Set these as environment variables before `./install.sh`:
 | `SHARE_NAME` | _(empty = sync everything)_ | Name of ONE shared item under "Shared with me"; leave empty to sync every shared folder (or all of "My files" with `OWNER_MODE=1`) |
 | `LOCAL_DIR` | `~/Proton Drive/$SHARE_NAME` | Local target folder (single-folder and owner-everything installs) |
 | `ALLOW_EXISTING` | `0` | `1` skips the empty-folder check (conversions; see `convert-to-sync-all.sh`) |
+| `SKIP_INITIAL_SYNC` | `0` | `1` skips the initial bisync and starts the watchers directly (conversions where files are already in sync) |
 | `REMOTE_NAME` | `protondrive` | rclone remote name |
 | `RCLONE_BINARY` | auto-detected | Path to `protonsync-rclone` |
 | `UPLOAD_DEBOUNCE` | `5` | Seconds before uploading a local change |
@@ -127,8 +128,9 @@ Files deleted via a remote event are first moved to a dated recovery folder at
 Trigger a manual full sync / repair (the bisync service is masked by default):
 
 ```bash
-systemctl --user unmask protonsync-bisync.service
-systemctl --user start protonsync-bisync.service
+u=~/.config/systemd/user/protonsync-bisync.service   # manual full sync / repair
+rm "$u" && mv "$u.locked" "$u" && systemctl --user daemon-reload \
+  && systemctl --user start protonsync-bisync.service  # (masked by default; add -<folder> suffix on sync-everything installs)
 ```
 
 ## Build from source

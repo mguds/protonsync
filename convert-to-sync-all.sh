@@ -13,9 +13,10 @@ set -euo pipefail
 # The script detects which of the two variants the old installation used and
 # picks the matching sync-everything variant.
 #
-# Local files are NOT re-downloaded: the folder that is already in sync is
-# reused where it is (moved into place under ~/Proton Drive if needed), and
-# the first bisync only checksums it against Proton.
+# Local files are NOT re-downloaded and NO bisync is run: the folder that is
+# already in sync is reused where it is (moved into place under
+# ~/Proton Drive if needed), and the watchers start directly with the event
+# stream anchored at "now".
 #
 # Run from the protonsync kit (same folder as install.sh):
 #   ./convert-to-sync-all.sh
@@ -124,14 +125,15 @@ fi
 
 # ---------------------------------------------------------------------------
 # Install the sync-everything setup. ALLOW_EXISTING=1 because the files are
-# already local — the first bisync checksums them instead of re-downloading.
+# already local, and SKIP_INITIAL_SYNC=1 because they are already in sync —
+# no bisync is run, the watchers start directly.
 # ---------------------------------------------------------------------------
 echo
-echo "Installing the sync-everything setup..."
+echo "Installing the sync-everything setup (no new bisync)..."
 if [[ "$OLD_MODE" == "owner" ]]; then
-    SHARE_NAME="" OWNER_MODE=1 ALLOW_EXISTING=1 "$KIT_DIR/install.sh"
+    SHARE_NAME="" OWNER_MODE=1 ALLOW_EXISTING=1 SKIP_INITIAL_SYNC=1 "$KIT_DIR/install.sh"
 else
-    SHARE_NAME="" ALLOW_EXISTING=1 "$KIT_DIR/install.sh"
+    SHARE_NAME="" ALLOW_EXISTING=1 SKIP_INITIAL_SYNC=1 "$KIT_DIR/install.sh"
 fi
 
 echo

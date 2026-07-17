@@ -40,6 +40,10 @@ set -euo pipefail
 #                          check. Only for conversions where the local files
 #                          are ALREADY a copy of the Proton folder (bisync then
 #                          just checksums them instead of re-downloading).
+#   SKIP_INITIAL_SYNC=1    Do not run the initial bisync at all — enable the
+#                          watchers directly. Only for conversions where the
+#                          local files are known to be in sync already; the
+#                          event stream is anchored at "now".
 # -------------------------------------------------------------------------
 
 REMOTE_NAME="${REMOTE_NAME:-protondrive}"
@@ -530,6 +534,14 @@ SCRIPT
 }
 
 generate_share_units() {
+    # A previous event-only install leaves the bisync/reconcile unit names as
+    # /dev/null symlinks (masked) with the real files parked as *.locked.
+    # Remove both first, so the fresh units below become real files instead of
+    # being written through the symlink into /dev/null.
+    rm -f "$SERVICE_FILE" "$SERVICE_FILE.locked" \
+        "$RECONCILE_SERVICE_FILE" "$RECONCILE_SERVICE_FILE.locked" \
+        "$WATCHER_SERVICE_FILE" "$EVENT_SERVICE_FILE"
+
     cat >"$SERVICE_FILE" <<SERVICE
 [Unit]
 Description=Full bisync of Proton folder '${SHARE_LABEL}' (initial sync and repair)
@@ -816,15 +828,19 @@ for i in "${!SHARE_NAMES[@]}"; do
 
     systemctl --user disable --now "protonsync-upload-watch$SFX.service" 2>/dev/null || true
     systemctl --user disable --now "protonsync-event-watch$SFX.service" 2>/dev/null || true
-    echo "Performing the initial full download of '${SHARE_LABEL}' before enabling monitoring..."
-    # Unmask first in case a previous run masked these (see below), so the
-    # one-time initial bisync can still run when install.sh is re-run.
+    # The unit files were rewritten as real files above; make sure systemd
+    # forgets any old mask state before they are used.
     systemctl --user unmask "protonsync-bisync$SFX.service" "protonsync-reconcile$SFX.service" >/dev/null 2>&1 || true
     systemctl --user daemon-reload
-    if ! systemctl --user start "protonsync-bisync$SFX.service"; then
-        echo "Initial sync of '${SHARE_LABEL}' FAILED — see $LOG_FILE" >&2
-        FAILED_SHARES+=("${SHARE_LABEL}")
-        continue
+    if [[ "${SKIP_INITIAL_SYNC:-0}" == "1" ]]; then
+        echo "Skipping the initial sync of '${SHARE_LABEL}' (SKIP_INITIAL_SYNC=1; local files assumed in sync)."
+    else
+        echo "Performing the initial full download of '${SHARE_LABEL}' before enabling monitoring..."
+        if ! systemctl --user start "protonsync-bisync$SFX.service"; then
+            echo "Initial sync of '${SHARE_LABEL}' FAILED — see $LOG_FILE" >&2
+            FAILED_SHARES+=("${SHARE_LABEL}")
+            continue
+        fi
     fi
     systemctl --user enable --now "protonsync-upload-watch$SFX.service"
     systemctl --user enable --now "protonsync-event-watch$SFX.service"
@@ -838,11 +854,20 @@ for i in "${!SHARE_NAMES[@]}"; do
     # event-driven: the event watcher recovers by re-anchoring the event stream
     # (never a full bisync), so the reconcile-via-bisync path is redundant. Mask
     # both bisync units so nothing — reconcile trigger, timer, or manual start —
-    # can launch a full bisync again. To run a full repair later, unmask first:
-    #   systemctl --user unmask protonsync-bisync$SFX.service && \
-    #       systemctl --user start protonsync-bisync$SFX.service
+    # can launch a full bisync again. Plain "systemctl mask" refuses when the
+    # real unit file lives in ~/.config/systemd/user, so park the real file as
+    # *.locked and point the unit name at /dev/null. To run a full repair later:
+    #   u=~/.config/systemd/user/protonsync-bisync<suffix>.service
+    #   rm "$u" && mv "$u.locked" "$u" && systemctl --user daemon-reload \
+    #       && systemctl --user start protonsync-bisync<suffix>.service
     if [[ "$AUDIT_MODE" != "1" ]]; then
-        systemctl --user mask "protonsync-bisync$SFX.service" "protonsync-reconcile$SFX.service" >/dev/null 2>&1 || true
+        for unit_file in "$SERVICE_FILE" "$RECONCILE_SERVICE_FILE"; do
+            if [[ -f "$unit_file" && ! -L "$unit_file" ]]; then
+                mv "$unit_file" "$unit_file.locked"
+                ln -sfn /dev/null "$unit_file"
+            fi
+        done
+        systemctl --user daemon-reload
     fi
 done
 systemctl --user enable --now protonsync-health.timer
