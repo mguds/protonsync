@@ -198,6 +198,20 @@ single)
     add_share "$SHARE_NAME" ""
     ;;
 owner-all)
+    # Owner-all defaults to ~/Proton Drive as its local root. If per-share
+    # sync-everything instances already live under that folder, require a
+    # separate LOCAL_DIR so the two installs never watch the same files.
+    OWNER_TARGET="${LOCAL_DIR_OVERRIDE:-$PROTON_DIR}"
+    if compgen -G "$UNIT_DIR/protonsync-upload-watch-*.service" >/dev/null && \
+        { [[ "$OWNER_TARGET" == "$PROTON_DIR" || "$OWNER_TARGET" == "$PROTON_DIR/"* || "$PROTON_DIR" == "$OWNER_TARGET/"* ]]; }; then
+        cat >&2 <<MSG
+This machine already syncs shared folders into "$PROTON_DIR". An owner-all
+install must then use its own separate local folder, for example:
+
+  OWNER_MODE=1 LOCAL_DIR="\$HOME/Proton Drive - My files" ./install.sh
+MSG
+        exit 7
+    fi
     if [[ -f "$HOME/.local/bin/protonsync-upload-watch" ]] && \
         ! grep -qF -- "--remote \"${REMOTE_NAME}:\"" "$HOME/.local/bin/protonsync-upload-watch"; then
         cat >&2 <<MSG
@@ -214,15 +228,31 @@ MSG
     add_share "" ""
     ;;
 shared-all)
+    # An unsuffixed install (single folder, or owner-all) may already exist.
+    # That is fine as long as its local folder does not overlap ~/Proton Drive,
+    # where the per-share instances live — e.g. an owner-all install with
+    # LOCAL_DIR="$HOME/Proton Drive - My files" can coexist with shared-all.
     if [[ -f "$UNIT_DIR/protonsync-upload-watch.service" ]]; then
-        cat >&2 <<MSG
-An existing single-folder protonsync installation was found on this machine.
-Mixing it with a sync-everything install would watch the same folder twice.
+        existing_local="$(grep -oE -- '--local-dir "[^"]+"' "$HOME/.local/bin/protonsync-upload-watch" 2>/dev/null \
+            | head -1 | sed -E 's/^--local-dir "//; s/"$//')"
+        if [[ -z "$existing_local" || "$existing_local" == "$PROTON_DIR" || "$existing_local" == "$PROTON_DIR/"* ]]; then
+            cat >&2 <<MSG
+An existing protonsync installation on this machine syncs
+  ${existing_local:-<unknown>}
+which overlaps the folders a sync-everything install would create under
+"$PROTON_DIR". Watching the same files twice is not safe.
 
-Run ./uninstall.sh first (your local files, sync state and Proton login are
-preserved), then run ./install.sh again.
+Either convert it with ./convert-to-sync-all.sh, or run ./uninstall.sh first
+(your local files, sync state and Proton login are preserved).
+
+Tip: to combine "everything I own" AND "everything shared with me" on one
+machine, give the owner install its own separate folder first:
+  OWNER_MODE=1 LOCAL_DIR="\$HOME/Proton Drive - My files" ./install.sh
+then run ./install.sh (no SHARE_NAME) for the shared folders.
 MSG
-        exit 7
+            exit 7
+        fi
+        echo "Existing install at '$existing_local' does not overlap — keeping it alongside."
     fi
     if ! "$RCLONE" protonshares --help >/dev/null 2>&1; then
         echo "This rclone build does not contain the protonshares command." >&2
