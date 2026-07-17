@@ -43,8 +43,9 @@ fi
 # ---------------------------------------------------------------------------
 # Read the old configuration out of the generated wrapper.
 # ---------------------------------------------------------------------------
-old_remote="$(sed -nE 's/^[[:space:]]*--remote "(.*)" \\$/\1/p' "$OLD_WRAPPER" | head -1)"
-old_local="$(sed -nE 's/^[[:space:]]*--local-dir "(.*)" \\$/\1/p' "$OLD_WRAPPER" | head -1)"
+# Tolerates both the multi-line wrapper (from install.sh) and one-line variants.
+old_remote="$(grep -oE -- '--remote "[^"]+"' "$OLD_WRAPPER" | head -1 | sed -E 's/^--remote "//; s/"$//')"
+old_local="$(grep -oE -- '--local-dir "[^"]+"' "$OLD_WRAPPER" | head -1 | sed -E 's/^--local-dir "//; s/"$//')"
 if [[ -z "$old_remote" || -z "$old_local" ]]; then
     echo "Could not read the old configuration from $OLD_WRAPPER." >&2
     exit 1
