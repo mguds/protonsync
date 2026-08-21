@@ -100,6 +100,15 @@ var commandDefinition = &cobra.Command{
 	},
 }
 
+// protonEventCallTimeout bounds a single lightweight event-API call
+// (fetching the latest event ID, or polling for changes since one). These
+// are single HTTP round trips, unlike buildIndex which legitimately walks
+// the whole tree and is intentionally left unbounded. Without this bound, a
+// stalled or endlessly-retried request can hang the watcher indefinitely
+// instead of erroring out and letting the existing degraded/retry and
+// in-place-reindex recovery paths do their job.
+const protonEventCallTimeout = 2 * time.Minute
+
 type eventWatcher struct {
 	source         eventSource
 	fsrc           fs.Fs
@@ -257,7 +266,9 @@ func (w *eventWatcher) buildIndex(ctx context.Context) error {
 // current latest event. It is used both for the first run and to self-heal an
 // expired Proton event stream ("refresh") in place, without a full bisync.
 func (w *eventWatcher) reindex(ctx context.Context) error {
-	eventID, err := w.source.LatestEventID(ctx)
+	latestCtx, latestCancel := context.WithTimeout(ctx, protonEventCallTimeout)
+	eventID, err := w.source.LatestEventID(latestCtx)
+	latestCancel()
 	if err != nil {
 		return fmt.Errorf("get latest Proton event ID: %w", err)
 	}
@@ -463,7 +474,9 @@ func (w *eventWatcher) withLock(fn func() error) error {
 }
 
 func (w *eventWatcher) poll(ctx context.Context) error {
-	batch, err := w.source.PollEvents(ctx, w.state.EventID)
+	pollCtx, pollCancel := context.WithTimeout(ctx, protonEventCallTimeout)
+	batch, err := w.source.PollEvents(pollCtx, w.state.EventID)
+	pollCancel()
 	if err != nil {
 		// A failed poll (network blip, transient API error) is recoverable:
 		// log it and retry on the next tick instead of exiting the process or

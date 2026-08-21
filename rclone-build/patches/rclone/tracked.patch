@@ -1,5 +1,5 @@
 diff --git a/backend/protondrive/protondrive.go b/backend/protondrive/protondrive.go
-index 502ca7c..df422bf 100644
+index 502ca7c..1e90557 100644
 --- a/backend/protondrive/protondrive.go
 +++ b/backend/protondrive/protondrive.go
 @@ -199,6 +199,20 @@ cache. Thus, if there are concurrent clients accessing the same mount point,
@@ -31,7 +31,49 @@ index 502ca7c..df422bf 100644
  }
  
  // Fs represents a remote proton drive
-@@ -505,6 +520,34 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
+@@ -431,6 +446,12 @@ func (l protonLogger) Errorf(format string, v ...interface{}) { fs.Errorf(l.f, f
+ func (l protonLogger) Warnf(format string, v ...interface{})  { fs.Logf(l.f, format, v...) }
+ func (l protonLogger) Debugf(format string, v ...interface{}) { fs.Debugf(l.f, format, v...) }
+ 
++// protonDriveLoginTimeout bounds each login attempt (cached-credential or
++// username+password) so a stalled network call can never hang the process
++// indefinitely. A stale cached session must fail fast enough to fall
++// through to a fresh password login within a human-noticeable time.
++const protonDriveLoginTimeout = 90 * time.Second
++
+ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper) (*protonDriveAPI.ProtonDrive, error) {
+ 	config := protonDriveAPI.NewDefaultConfig()
+ 	config.AppVersion = opt.AppVersion
+@@ -464,13 +485,14 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
+ 		config.ReusableCredential.RefreshToken = refreshToken
+ 		config.ReusableCredential.SaltedKeyPass = saltedKeyPass
+ 
+-		protonDrive /* credential will be nil since access credentials are passed in */, _, err := protonDriveAPI.NewProtonDrive(ctx, config, authHandler, deAuthHandler)
++		cachedCtx, cachedCancel := context.WithTimeout(ctx, protonDriveLoginTimeout)
++		protonDrive /* credential will be nil since access credentials are passed in */, _, err := protonDriveAPI.NewProtonDrive(cachedCtx, config, authHandler, deAuthHandler)
++		cachedCancel()
+ 		if err != nil {
+-			fs.Debugf(f, "Cached credential doesn't work, clearing and using the fallback login method")
++			fs.Logf(f, "Cached credential doesn't work (%v), clearing and using the fallback login method", err)
+ 			// clear the access token on failure
+ 			clearConfigMap(m)
+ 
+-			fs.Debugf(f, "couldn't initialize a new proton drive instance using cached credentials: %v", err)
+ 			// we fallback to username+password login -> don't throw an error here
+ 			// return nil, fmt.Errorf("couldn't initialize a new proton drive instance: %w", err)
+ 		} else {
+@@ -494,7 +516,9 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
+ 		}
+ 		config.FirstLoginCredential.TwoFA = code
+ 	}
+-	protonDrive, auth, err := protonDriveAPI.NewProtonDrive(ctx, config, authHandler, deAuthHandler)
++	passwordCtx, passwordCancel := context.WithTimeout(ctx, protonDriveLoginTimeout)
++	protonDrive, auth, err := protonDriveAPI.NewProtonDrive(passwordCtx, config, authHandler, deAuthHandler)
++	passwordCancel()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("couldn't initialize a new proton drive instance: %w", err)
+ 	}
+@@ -505,6 +529,34 @@ func newProtonDrive(ctx context.Context, f *Fs, opt *Options, m configmap.Mapper
  	return protonDrive, nil
  }
  
@@ -66,7 +108,7 @@ index 502ca7c..df422bf 100644
  // NewFs constructs an Fs from the path, container:path
  func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
  	// pacer is not used in NewFs()
-@@ -569,6 +612,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
+@@ -569,6 +621,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
  	}
  	f.protonDrive = protonDrive
  

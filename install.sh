@@ -734,6 +734,8 @@ set -euo pipefail
 STATE="$HOME/.local/state"
 UNITS="$HOME/.config/systemd/user"
 LOCAL_DIR="${PROTONSYNC_LOCAL_DIR:-$HOME/Proton Drive}"
+RCLONE_CONFIG="$HOME/.config/rclone/rclone.conf"
+AUTH_MARKER="$STATE/protonsync-auth-remediation.marker"
 failed=0
 
 for unit_file in "$UNITS"/protonsync-upload-watch*.service "$UNITS"/protonsync-event-watch*.service; do
@@ -762,6 +764,7 @@ fi
 
 now=$(date +%s)
 found_health=0
+status_unhealthy=0
 for file in "$STATE"/protonsync-upload-health*.json "$STATE"/protonsync-event-health*.json; do
     [[ -f "$file" ]] || continue
     found_health=1
@@ -776,9 +779,10 @@ import pathlib
 import sys
 
 try:
-    print(json.loads(pathlib.Path(sys.argv[1]).read_text())["status"])
+    data = json.loads(pathlib.Path(sys.argv[1]).read_text())
 except Exception:
-    print("invalid")
+    data = {}
+print(data.get("status", "invalid"))
 PY
 )
     case "$status" in
@@ -786,12 +790,89 @@ PY
         *)
             printf 'ERROR: unhealthy status %s in %s\n' "$status" "$file"
             failed=1
+            status_unhealthy=1
             ;;
     esac
 done
 if [[ "$found_health" == 0 ]]; then
     printf 'ERROR: no protonsync health files found\n'
     failed=1
+fi
+
+# A persistent unhealthy status (most commonly an expired/revoked Proton
+# session after weeks away, but also any other stuck watcher) will not fix
+# itself. Rather than pattern-matching the underlying error text - which
+# varies by API response and isn't reliably "401"/"Unauthorized" in
+# practice - treat SUSTAINED unhealthiness as the signal: if any health
+# file has reported a non-ok status continuously for more than 20 minutes,
+# clear the cached Proton session tokens (falls back to the stored
+# username+password on next login) and restart the watchers.
+# Rate-limited to once per hour so a genuinely wrong stored password
+# doesn't cause a restart loop hammering Proton's login endpoint.
+UNHEALTHY_SINCE="$STATE/protonsync-unhealthy-since.marker"
+if [[ "$status_unhealthy" == 0 ]]; then
+    rm -f "$UNHEALTHY_SINCE"
+fi
+if [[ "$status_unhealthy" == 1 ]]; then
+    [[ -f "$UNHEALTHY_SINCE" ]] || echo "$now" >"$UNHEALTHY_SINCE"
+fi
+unhealthy_since=0
+[[ -f "$UNHEALTHY_SINCE" ]] && unhealthy_since=$(cat "$UNHEALTHY_SINCE" 2>/dev/null || echo 0)
+if [[ "$status_unhealthy" == 1 && -f "$RCLONE_CONFIG" && "$unhealthy_since" != 0 && $(( now - unhealthy_since )) -gt 1200 ]]; then
+    last_attempt=0
+    [[ -f "$AUTH_MARKER" ]] && last_attempt=$(cat "$AUTH_MARKER" 2>/dev/null || echo 0)
+    if (( now - last_attempt > 3600 )); then
+        printf 'REMEDIATION: status unhealthy for over 20 min; clearing cached Proton session and restarting watchers\n'
+        mkdir -p "$STATE"
+        echo "$now" >"$AUTH_MARKER"
+        cp -a "$RCLONE_CONFIG" "$RCLONE_CONFIG.bak-$(date +%Y%m%d-%H%M%S)"
+        python3 - "$RCLONE_CONFIG" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").readlines()
+
+CLEARED_KEYS = {
+    "client_uid",
+    "client_access_token",
+    "client_refresh_token",
+    "client_salted_key_pass",
+}
+
+# Pass 1: find [section] blocks whose body contains "type = protondrive".
+section_bounds = []  # (start_line_idx, end_line_idx_exclusive)
+start = None
+for i, line in enumerate(lines):
+    if re.match(r"^\[.+\]\s*$", line.strip()):
+        if start is not None:
+            section_bounds.append((start, i))
+        start = i
+if start is not None:
+    section_bounds.append((start, len(lines)))
+
+protondrive_ranges = []
+for start, end in section_bounds:
+    body = lines[start:end]
+    if any(re.match(r"^type\s*=\s*protondrive\s*$", l.strip()) for l in body):
+        protondrive_ranges.append((start, end))
+
+# Pass 2: within those ranges, blank the four cached-session keys.
+for start, end in protondrive_ranges:
+    for i in range(start, end):
+        m = re.match(r"^(\w+)\s*=", lines[i].strip())
+        if m and m.group(1) in CLEARED_KEYS:
+            lines[i] = f"{m.group(1)} =\n"
+
+open(path, "w", encoding="utf-8").writelines(lines)
+PY
+        for unit_file in "$UNITS"/protonsync-upload-watch*.service "$UNITS"/protonsync-event-watch*.service; do
+            [[ -f "$unit_file" ]] || continue
+            systemctl --user restart "$(basename "$unit_file")" 2>/dev/null || true
+        done
+        command -v notify-send >/dev/null 2>&1 &&
+            notify-send "protonsync" "Persistent error detected - Proton login refreshed automatically" 2>/dev/null || true
+    fi
 fi
 
 for log in "$STATE"/protonsync-*.log; do
