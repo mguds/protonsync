@@ -29,6 +29,7 @@ rm -f \
     "$HOME/.local/bin"/protonsync-upload-watch* \
     "$HOME/.local/bin"/protonsync-event-watch* \
     "$HOME/.local/bin"/protonsync-reconcile* \
+    "$HOME/.local/bin"/protonsync-pull* \
     "$HOME/.local/bin/protonsync-status" \
     "$HOME/.local/bin/protonsync-health" \
     "$HOME/.local/lib/protonsync/protonsync-upload-watch.py" \

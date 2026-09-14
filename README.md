@@ -25,13 +25,23 @@ protonsync runs two lightweight, always-on services per user:
 2. **Event watcher** (`protonsync-event-watch`) — the new `protonwatch` rclone
    command reads Proton Drive's change-event stream and downloads only the items
    that actually changed (default poll: every 15 seconds).
+3. **Drift pull** (`protonsync-pull`) — a periodic, one-way, additive-only
+   `rclone copy` safety net behind the event watcher. The event watcher is
+   purely incremental, so a skipped event (a transient error, a gap while the
+   PC was off, an expired cursor) is never retried on its own; drift pull
+   catches those by fetching anything missing or newer, at low CPU/IO
+   priority and a gentle API rate limit. It never deletes a local file, and a
+   run is capped at 20 minutes so a stalled connection can't hold the shared
+   lock indefinitely — a bigger backlog just takes a few scheduled runs.
+   Default schedule: shortly after startup, then every 12 hours, plus a
+   guaranteed daily run.
 
 A full two-way `bisync` is used **only** for the **initial download** of the
 whole shared folder on first install; the installer then masks the bisync
-services. After that recovery is event-based and self-healing: a single event
-that cannot be applied is skipped and logged, and a broken or expired event
-stream is re-anchored in place (fresh index from "now") with backoff — no full
-sync is ever run automatically again.
+services. After that, recovery is event-based and self-healing (a single
+event that cannot be applied is skipped and logged, a broken or expired event
+stream is re-anchored in place with backoff) with drift pull as the backstop
+— no full sync is ever run automatically again.
 
 There is **no** periodic full sync. A scheduled audit sync is available as an
 opt-in (`AUDIT_MODE=1`), disabled by default.
@@ -113,13 +123,25 @@ Set these as environment variables before `./install.sh`:
 | `EVENT_POLL_INTERVAL` | `15s` | Remote event poll interval |
 | `AUDIT_MODE` | `0` | `1` enables an opt-in scheduled audit sync |
 | `AUDIT_CALENDAR` | `Sun *-*-* 08:00:00` | `OnCalendar` for the audit (if enabled) |
+| `PULL_ENABLED` | `1` | `0` disables the drift-pull safety net |
+| `PULL_CALENDAR` | `*-*-* 05:00:00` | `OnCalendar` for the guaranteed daily drift-pull run |
+| `PULL_INTERVAL` | `12h` | Interval between drift-pull runs otherwise |
+| `PULL_TPSLIMIT` | `4` | Proton API requests/second during a drift-pull run |
+| `PULL_TIME_BUDGET` | `1200` | Max seconds per drift-pull run before it is cut off |
+
+Already installed and want to add drift pull without re-running `install.sh`?
+
+```bash
+./upgrade-driftpull.sh
+```
 
 ## Status, logs and recovery
 
 ```bash
-protonsync-status                 # services, queue, health, last sync
+protonsync-status                 # services, queue, health, last sync, last drift pull
 tail -f ~/.local/state/protonsync-upload-watch.log
 tail -f ~/.local/state/protonsync-event-watch.log
+tail -f ~/.local/state/protonsync-pull.log
 ```
 
 Files deleted via a remote event are first moved to a dated recovery folder at

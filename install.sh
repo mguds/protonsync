@@ -55,6 +55,27 @@ AUDIT_CALENDAR="${AUDIT_CALENDAR:-Sun *-*-* 08:00:00}"
 OWNER_MODE="${OWNER_MODE:-0}"
 LOCAL_DIR_OVERRIDE="${LOCAL_DIR:-}"
 
+# Drift pull: a periodic one-way "download anything on Proton that is missing
+# or older locally" pass. The event watcher can silently miss files (an event
+# skipped after a transient download error, a gap while the PC was off, an
+# expired event cursor rebuilt in place without re-fetching the gap). Bisync
+# used to be the safety net but is masked in event-only mode, so nothing
+# otherwise ever notices those gaps. This pass is that net: additive only
+# (never deletes a local file), rate-limited, and run at low CPU/IO priority
+# so it stays invisible while you work.
+PULL_ENABLED="${PULL_ENABLED:-1}"
+PULL_CALENDAR="${PULL_CALENDAR:-*-*-* 05:00:00}"
+PULL_INTERVAL="${PULL_INTERVAL:-12h}"
+PULL_TPSLIMIT="${PULL_TPSLIMIT:-4}"
+# Hard wall-clock cap per run (seconds). A stalled TCP connection (observed in
+# practice after a laptop resumes on a mobile hotspot: the pooled connection
+# looks alive but every read on it hangs) would otherwise hold the shared API
+# lock indefinitely, starving uploads and the event watcher's own self-heal
+# for as long as the pull happens to hang - hours, in the incident that
+# prompted this. --update makes rclone copy safely resumable, so a run that
+# is cut short here just continues on the next scheduled run.
+PULL_TIME_BUDGET="${PULL_TIME_BUDGET:-1200}"
+
 # MODE: single (one named folder), owner-all (all of "My files"),
 # shared-all (every folder in "Shared with me", one instance per folder).
 if [[ -n "$SHARE_NAME" ]]; then
@@ -340,6 +361,11 @@ set_share_vars() {
     UPLOAD_HEALTH_FILE="$STATE_DIR/protonsync-upload-health$SFX.json"
     EVENT_HEALTH_FILE="$STATE_DIR/protonsync-event-health$SFX.json"
     FALLBACK_MARKER="$STATE_DIR/protonsync-event-refresh-required$SFX"
+    PULL_SCRIPT="$HOME/.local/bin/protonsync-pull$SFX"
+    PULL_SERVICE_FILE="$UNIT_DIR/protonsync-pull$SFX.service"
+    PULL_TIMER_FILE="$UNIT_DIR/protonsync-pull$SFX.timer"
+    PULL_LOG_FILE="$STATE_DIR/protonsync-pull$SFX.log"
+    PULL_HEALTH_FILE="$STATE_DIR/protonsync-pull-health$SFX.json"
 }
 
 # ---------------------------------------------------------------------------
@@ -393,8 +419,11 @@ write_share_filter() {
 - **/Thumbs.db
 # If a file in the shared folder fails Proton PGP signature verification
 # ("signature made by unknown entity", typically uploaded by another member)
-# and aborts the initial bisync, exclude it here ("- /path/to/file") and
-# restart the bisync. The event watchers skip such files on their own.
+# and aborts the initial bisync or errors every drift pull, exclude it here
+# ("- /path/to/file") and restart the bisync. The event watcher and drift
+# pull both skip such files on their own once excluded; the alternative is
+# having the owner re-upload the file via the official Proton app, which
+# gives it a fresh, verifiable signature.
 FILTER
 }
 
@@ -561,6 +590,129 @@ while true; do
 done
 SCRIPT
     chmod 0755 "$EVENT_SCRIPT"
+
+    cat >"$PULL_SCRIPT" <<SCRIPT
+#!/usr/bin/env bash
+# protonsync drift pull: download anything on Proton that is missing locally
+# (or newer on Proton), as a safety net behind the event watcher. One-way and
+# additive only - it never deletes or moves a local file. Runs at low CPU/IO
+# priority and with a Proton API rate limit so it stays unobtrusive.
+set -u
+
+RCLONE="$RCLONE"
+REMOTE_DIR="$REMOTE_DIR"
+LOCAL_DIR="$LOCAL_DIR"
+LOCK_FILE="$LOCK_FILE"
+FILTER_FILE="$FILTER_FILE"
+LOG_FILE="$PULL_LOG_FILE"
+HEALTH_FILE="$PULL_HEALTH_FILE"
+TPSLIMIT="$PULL_TPSLIMIT"
+TIME_BUDGET="$PULL_TIME_BUDGET"
+
+mkdir -p "\$LOCAL_DIR" "\$(dirname "\$LOG_FILE")" "\$(dirname "\$LOCK_FILE")" \
+    "\$(dirname "\$HEALTH_FILE")"
+
+# Wait for DNS to actually work before starting. Persistent=true on the timer
+# means a run can be triggered the instant a laptop resumes from suspend, but
+# network-online.target does not reliably re-block a resume-triggered start
+# (it was already "reached" before suspend) - so without this, a resume-
+# triggered run fails immediately on a DNS lookup, before the network is
+# really back. Up to 2 minutes of grace; if still down, this run just logs the
+# failure and the next scheduled run (or the next resume) retries.
+for _ in \$(seq 1 24); do
+    getent hosts drive-api.proton.me >/dev/null 2>&1 && break
+    sleep 5
+done
+
+started="\$(date --iso-8601=seconds)"
+start_epoch="\$(date +%s)"
+run_log="\$(mktemp)"
+
+# The watchers keep running. rclone "copy" holds the shared API lock for its
+# transfers, so it never writes concurrently with the event watcher. A file
+# this pull downloads does trigger the upload watcher (inotify), but its
+# "copyto --checksum" then sees an identical object on Proton and does
+# nothing - a cheap no-op in the steady state, where the event watcher has
+# already applied almost everything and this pull only mops up a handful of
+# genuinely missed files. (For a large one-off backlog, stop the watchers by
+# hand first - see README.md.)
+
+FILTER_ARGS=()
+[[ -f "\$FILTER_FILE" ]] && FILTER_ARGS=(--filter-from "\$FILTER_FILE")
+
+PRIO=(nice -n 19)
+command -v ionice >/dev/null 2>&1 && PRIO+=(ionice -c 3)
+
+# "timeout" bounds actual run time so a stalled connection can never hold the
+# shared lock past this; "flock -w" only bounds how long we wait to ACQUIRE
+# the lock in the first place, which is a different thing. --kill-after gives
+# rclone a chance to shut down cleanly before being SIGKILLed.
+flock -w 7200 "\$LOCK_FILE" \
+    timeout --kill-after=30s "\$TIME_BUDGET" \
+    "\${PRIO[@]}" \
+    "\$RCLONE" copy "\$REMOTE_DIR" "\$LOCAL_DIR" \
+    "\${FILTER_ARGS[@]}" \
+    --update \
+    --use-server-modtime \
+    --transfers 2 \
+    --checkers 4 \
+    --tpslimit "\$TPSLIMIT" \
+    --tpslimit-burst 1 \
+    --retries 1 \
+    --low-level-retries 10 \
+    --stats-one-line \
+    --stats 5m \
+    --log-file "\$run_log" \
+    --log-level INFO
+status=\$?
+# --retries 1 on purpose: a whole-run retry would re-walk the entire tree for
+# every persistently failing file (e.g. a signature-fail file excluded in the
+# filter above), which on Proton's slow API means tens of minutes of pure
+# overhead. This is a periodic sweep - anything genuinely missed by a
+# transient error is picked up by the next scheduled run. --low-level-retries
+# still covers mid-transfer blips. A backlog bigger than one time budget just
+# takes several scheduled runs to clear - --update makes that safe (already-
+# copied files are skipped on the next run).
+
+finished="\$(date --iso-8601=seconds)"
+duration=\$(( \$(date +%s) - start_epoch ))
+copied="\$(grep -c ': Copied (' "\$run_log" 2>/dev/null || true)"
+errors="\$(grep -c ' ERROR *: ' "\$run_log" 2>/dev/null || true)"
+copied="\${copied:-0}"; errors="\${errors:-0}"
+if [[ "\$status" -eq 0 ]]; then
+    state="ok"
+elif [[ "\$status" -eq 124 || "\$status" -eq 137 ]]; then
+    # Hit the time budget (124 = timeout's own SIGTERM, 137 = SIGKILL after
+    # --kill-after) rather than an actual error. Expected and fine for a large
+    # backlog - not "degraded" on its own unless it also logged real errors.
+    state="ok"; [[ "\$errors" -gt 0 ]] && state="degraded"
+else
+    state="degraded"
+fi
+
+tmp_health="\$HEALTH_FILE.tmp"
+cat >"\$tmp_health" <<JSON
+{
+  "status": "\$state",
+  "updated": "\$finished",
+  "started": "\$started",
+  "duration_seconds": \$duration,
+  "copied": \$copied,
+  "errors": \$errors,
+  "exit_code": \$status
+}
+JSON
+mv "\$tmp_health" "\$HEALTH_FILE"
+
+{
+    printf '=== drift pull %s -> %s (exit %s, copied %s, errors %s, %ss) ===\n' \
+        "\$started" "\$finished" "\$status" "\$copied" "\$errors" "\$duration"
+    cat "\$run_log"
+} >>"\$LOG_FILE"
+rm -f "\$run_log"
+exit "\$status"
+SCRIPT
+    chmod 0755 "$PULL_SCRIPT"
 }
 
 generate_share_units() {
@@ -570,7 +722,8 @@ generate_share_units() {
     # being written through the symlink into /dev/null.
     rm -f "$SERVICE_FILE" "$SERVICE_FILE.locked" \
         "$RECONCILE_SERVICE_FILE" "$RECONCILE_SERVICE_FILE.locked" \
-        "$WATCHER_SERVICE_FILE" "$EVENT_SERVICE_FILE"
+        "$WATCHER_SERVICE_FILE" "$EVENT_SERVICE_FILE" \
+        "$PULL_SERVICE_FILE" "$PULL_TIMER_FILE"
 
     cat >"$SERVICE_FILE" <<SERVICE
 [Unit]
@@ -631,6 +784,46 @@ TimeoutStartSec=infinity
 ExecStart=$RECONCILE_SCRIPT
 SERVICE
 
+    # Drift pull: safety-net one-way download pass (see PULL_* settings above).
+    # oneshot service + timer. Runs a while after boot, then on a fixed
+    # interval, plus a guaranteed daily pass, each with a random delay so
+    # multiple shares (and multiple PCs on a shared account) do not all hit
+    # Proton at the same moment.
+    if [[ "$PULL_ENABLED" == "1" ]]; then
+        cat >"$PULL_SERVICE_FILE" <<SERVICE
+[Unit]
+Description=Drift pull for Proton folder '${SHARE_LABEL}' (download missing files)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20
+IOWeight=20
+ExecStart=$PULL_SCRIPT
+SERVICE
+
+        cat >"$PULL_TIMER_FILE" <<TIMER
+[Unit]
+Description=Schedule drift pull for Proton folder '${SHARE_LABEL}'
+
+[Timer]
+OnActiveSec=10min
+OnUnitActiveSec=$PULL_INTERVAL
+OnCalendar=$PULL_CALENDAR
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER
+    else
+        rm -f "$PULL_SERVICE_FILE" "$PULL_TIMER_FILE"
+    fi
+
     # Optional, opt-in scheduled full-sync audit. Disabled by default; the fast
     # event sync plus on-demand repair is enough for normal operation.
     if [[ "$AUDIT_MODE" == "1" ]]; then
@@ -673,6 +866,7 @@ printf 'protonsync status\n\n'
 for unit_file in \
     "$UNITS"/protonsync-upload-watch*.service \
     "$UNITS"/protonsync-event-watch*.service \
+    "$UNITS"/protonsync-pull*.timer \
     "$UNITS"/protonsync-bisync*.timer \
     "$UNITS"/protonsync-health.timer; do
     [[ -f "$unit_file" ]] || continue
@@ -699,12 +893,24 @@ PY
 done
 [[ "$found_queue" == 0 ]] && printf '0 pending\n'
 
-for health in "$STATE"/protonsync-upload-health*.json "$STATE"/protonsync-event-health*.json; do
+for health in "$STATE"/protonsync-upload-health*.json "$STATE"/protonsync-event-health*.json \
+    "$STATE"/protonsync-pull-health*.json; do
     [[ -f "$health" ]] || continue
     printf '\n%s:\n' "$(basename "$health")"
     cat "$health"
     printf '\n'
 done
+
+printf '\nLast drift pull:\n'
+shown_pull=0
+for log in "$STATE"/protonsync-pull*.log; do
+    [[ -f "$log" ]] || continue
+    [[ "$log" == *-health*.json ]] && continue
+    shown_pull=1
+    printf -- '--- %s ---\n' "$(basename "$log")"
+    grep '^=== drift pull ' "$log" 2>/dev/null | tail -n 3 || true
+done
+[[ "$shown_pull" == 0 ]] && printf 'not run yet\n'
 
 printf '\nRecovery copies: '
 find "$STATE"/protonsync-recovery* -type f 2>/dev/null | wc -l
@@ -753,6 +959,30 @@ for unit_file in "$UNITS"/protonsync-bisync*.service "$UNITS"/protonsync-reconci
     if systemctl --user is-failed --quiet "$unit"; then
         printf 'ERROR: %s is failed\n' "$unit"
         failed=1
+    fi
+done
+
+# Drift pull is the safety net behind the event watcher. A failed last run is
+# not fatal (the next scheduled run retries), but a pull that has not
+# completed for days, or whose timer has stopped, means drift can accumulate
+# unnoticed - surface it without triggering the auth remediation below.
+for unit_file in "$UNITS"/protonsync-pull*.timer; do
+    [[ -f "$unit_file" ]] || continue
+    unit="$(basename "$unit_file")"
+    if ! systemctl --user is-active --quiet "$unit" && ! systemctl --user is-enabled --quiet "$unit"; then
+        printf 'WARNING: %s is not scheduled\n' "$unit"
+    fi
+done
+pull_now=$(date +%s)
+for file in "$STATE"/protonsync-pull-health*.json; do
+    [[ -f "$file" ]] || continue
+    modified=$(stat -c %Y "$file")
+    if (( pull_now - modified > 345600 )); then
+        printf 'WARNING: drift pull has not completed in over 4 days (%s)\n' "$(basename "$file")"
+    fi
+    pull_errors=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("errors",0))' "$file" 2>/dev/null || echo 0)
+    if [[ "${pull_errors:-0}" -gt 0 ]]; then
+        printf 'NOTICE: last drift pull reported %s download error(s) - see protonsync-pull*.log\n' "$pull_errors"
     fi
 done
 
@@ -924,7 +1154,8 @@ for i in "${!SHARE_NAMES[@]}"; do
         "protonsync-bisync$SFX.service" \
         "protonsync-upload-watch$SFX.service" \
         "protonsync-event-watch$SFX.service" \
-        "protonsync-reconcile$SFX.service"; do
+        "protonsync-reconcile$SFX.service" \
+        "protonsync-pull$SFX.service"; do
         systemctl --user reset-failed "$unit" 2>/dev/null || true
     done
 done
@@ -955,6 +1186,15 @@ for i in "${!SHARE_NAMES[@]}"; do
     fi
     systemctl --user enable --now "protonsync-upload-watch$SFX.service"
     systemctl --user enable --now "protonsync-event-watch$SFX.service"
+    if [[ "$PULL_ENABLED" == "1" ]]; then
+        # Schedule the safety-net pull. Do NOT start it here: on a fresh install
+        # the initial download already fetched everything, and on a conversion
+        # the timer's first run (OnBootSec / OnCalendar) will catch any drift
+        # soon enough without holding up the installer.
+        systemctl --user enable --now "protonsync-pull$SFX.timer"
+    else
+        systemctl --user disable --now "protonsync-pull$SFX.timer" 2>/dev/null || true
+    fi
     if [[ "$AUDIT_MODE" == "1" ]]; then
         systemctl --user enable --now "protonsync-bisync$SFX.timer"
     else
@@ -1016,6 +1256,11 @@ shared-all)
 esac
 echo "Local upload delay:   about $UPLOAD_DEBOUNCE seconds"
 echo "Event poll interval:  $EVENT_POLL_INTERVAL"
+if [[ "$PULL_ENABLED" == "1" ]]; then
+    echo "Drift pull:           every $PULL_INTERVAL + daily ($PULL_CALENDAR), low priority"
+else
+    echo "Drift pull:           disabled (PULL_ENABLED=0)"
+fi
 if [[ "$AUDIT_MODE" == "1" ]]; then
     echo "Scheduled audit:      enabled ($AUDIT_CALENDAR)"
 else
