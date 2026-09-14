@@ -44,6 +44,13 @@ set -euo pipefail
 #                          watchers directly. Only for conversions where the
 #                          local files are known to be in sync already; the
 #                          event stream is anchored at "now".
+#   DEFER_SHARES           Comma-separated list of exact "Shared with me"
+#                          folder names to process LAST (default: unset, no
+#                          effect on order). Every other folder keeps the
+#                          order it was returned in. Useful when re-running
+#                          after an interrupted install: defer a folder
+#                          that's already fully synced so folders still
+#                          needing their real first download go first.
 # -------------------------------------------------------------------------
 
 REMOTE_NAME="${REMOTE_NAME:-protondrive}"
@@ -282,6 +289,19 @@ MSG
     fi
     echo "Listing everything under Proton Drive 'Shared with me'..."
     SHARES_RAW="$("$RCLONE" protonshares "${REMOTE_NAME}:")"
+    if [[ -n "${DEFER_SHARES:-}" ]]; then
+        # Process the named folder(s) last (e.g. one already fully synced from a
+        # previous run), so any other folder that still needs its real first
+        # download isn't stuck waiting behind a redundant re-verification.
+        # Stable sort keeps every other folder in its original relative order.
+        SHARES_RAW="$(printf '%s\n' "$SHARES_RAW" | awk -F'\t' -v defer="$DEFER_SHARES" '
+            BEGIN { n = split(defer, parts, ",") }
+            {
+                deferred = 0
+                for (i = 1; i <= n; i++) if ($2 == parts[i]) { deferred = 1; break }
+                print (deferred ? "1" : "0") "\t" $0
+            }' | sort -s -t$'\t' -k1,1 | cut -f2-)"
+    fi
     while IFS=$'\t' read -r kind name; do
         [[ -z "${name:-}" ]] && continue
         if [[ "$kind" != "d" ]]; then
@@ -355,6 +375,7 @@ set_share_vars() {
     EVENT_LOG_FILE="$STATE_DIR/protonsync-event-watch$SFX.log"
     EVENT_STATE_FILE="$STATE_DIR/protonsync-events$SFX.json"
     UPLOAD_QUEUE_FILE="$STATE_DIR/protonsync-upload-queue$SFX.json"
+    UPLOAD_MANIFEST_FILE="$STATE_DIR/protonsync-upload-manifest$SFX.json"
     DIRTY_DIR="$STATE_DIR/protonsync-dirty$SFX"
     SUPPRESS_DIR="$STATE_DIR/protonsync-suppress$SFX"
     RECOVERY_DIR="$STATE_DIR/protonsync-recovery$SFX"
@@ -500,6 +521,7 @@ exec /usr/bin/python3 "$WATCHER" \
     --suppress-dir "$SUPPRESS_DIR" \
     --health-file "$UPLOAD_HEALTH_FILE" \
     --reconcile-service "protonsync-reconcile$SFX.service" \
+    --manifest-file "$UPLOAD_MANIFEST_FILE" \
     --debounce "$UPLOAD_DEBOUNCE"
 SCRIPT
     chmod 0755 "$WATCHER_SCRIPT"
@@ -918,7 +940,7 @@ printf 'Last full sync:\n'
 for log in "$STATE"/protonsync-bisync*.log; do
     [[ -f "$log" ]] || continue
     [[ "$log" == *-audit*.log ]] && continue
-    printf '--- %s ---\n' "$(basename "$log")"
+    printf -- '--- %s ---\n' "$(basename "$log")"
     tail -n 3 "$log" 2>/dev/null || true
 done
 printf '\nLast audit:\n'
@@ -926,7 +948,7 @@ shown_audit=0
 for log in "$STATE"/protonsync-bisync-audit*.log; do
     [[ -f "$log" ]] || continue
     shown_audit=1
-    printf '--- %s ---\n' "$(basename "$log")"
+    printf -- '--- %s ---\n' "$(basename "$log")"
     tail -n 18 "$log" 2>/dev/null || true
 done
 [[ "$shown_audit" == 0 ]] && printf 'not available\n'

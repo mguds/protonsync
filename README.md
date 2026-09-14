@@ -117,6 +117,7 @@ Set these as environment variables before `./install.sh`:
 | `LOCAL_DIR` | `~/Proton Drive/$SHARE_NAME` | Local target folder (single-folder and owner-everything installs) |
 | `ALLOW_EXISTING` | `0` | `1` skips the empty-folder check (conversions; see `convert-to-sync-all.sh`) |
 | `SKIP_INITIAL_SYNC` | `0` | `1` skips the initial bisync and starts the watchers directly (conversions where files are already in sync) |
+| `DEFER_SHARES` | _(unset)_ | Comma-separated exact folder names to process last (sync-everything installs; useful to re-run past a folder that's already done) |
 | `REMOTE_NAME` | `protondrive` | rclone remote name |
 | `RCLONE_BINARY` | auto-detected | Path to `protonsync-rclone` |
 | `UPLOAD_DEBOUNCE` | `5` | Seconds before uploading a local change |

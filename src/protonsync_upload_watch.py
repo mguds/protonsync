@@ -103,12 +103,22 @@ class UploadWatcher:
         self.health_file = Path(args.health_file).expanduser()
         self.reconcile_service = args.reconcile_service
         self.debounce = args.debounce
+        manifest_file = getattr(args, "manifest_file", None)
+        self.manifest_file = (
+            Path(manifest_file).expanduser()
+            if manifest_file
+            else self.queue_file.with_name(
+                self.queue_file.name.replace("-upload-queue", "-upload-manifest")
+            )
+        )
         self.inotify = Inotify()
         self.watch_paths: dict[int, Path] = {}
         self.pending: dict[str, dict[str, object]] = {}
+        self.manifest: dict[str, list[int]] = {}
         self.last_health = 0.0
         self.reconcile_requested = False
         self.load_queue()
+        self.load_manifest()
 
     def load_queue(self) -> None:
         try:
@@ -132,6 +142,70 @@ class UploadWatcher:
 
     def persist_queue(self) -> None:
         atomic_json(self.queue_file, self.pending)
+
+    def load_manifest(self) -> None:
+        try:
+            value = json.loads(self.manifest_file.read_text(encoding="utf-8"))
+            if isinstance(value, dict):
+                self.manifest = value
+        except FileNotFoundError:
+            pass
+        except (OSError, json.JSONDecodeError):
+            logging.exception("Manifest is unreadable; rebuilding from scratch")
+
+    def persist_manifest(self) -> None:
+        atomic_json(self.manifest_file, self.manifest)
+
+    def reconcile_startup(self) -> None:
+        """Cheap, local-only catch-up for changes made while this watcher
+        was not running (PC off, service crashed, etc). Compares the current
+        local size+mtime of every file against the last snapshot recorded in
+        the manifest, with no remote/API calls. A missing manifest (first run
+        after enabling this feature, or a fresh install) is treated as an
+        already-synced baseline rather than a flood of uploads, since a full
+        bisync already reconciled everything before this watcher ever starts.
+        """
+        first_run = not self.manifest
+        queued = 0
+        for current, directories, files in os.walk(self.root, followlinks=False):
+            current_path = Path(current)
+            directories[:] = [
+                name
+                for name in directories
+                if not (current_path / name).is_symlink()
+                and not ignored((current_path / name).relative_to(self.root))
+            ]
+            for name in files:
+                path = current_path / name
+                if path.is_symlink():
+                    continue
+                relative_path = path.relative_to(self.root)
+                if ignored(relative_path):
+                    continue
+                relative = relative_path.as_posix()
+                snapshot = self.snapshot(path)
+                if snapshot is None:
+                    continue
+                known = self.manifest.get(relative)
+                if known is not None and tuple(known) == snapshot:
+                    continue
+                if first_run:
+                    self.manifest[relative] = list(snapshot)
+                    continue
+                if relative not in self.pending:
+                    self.queue(path, is_dir=False)
+                    queued += 1
+        if first_run:
+            self.persist_manifest()
+            logging.info(
+                "Startup reconciliation: built local manifest baseline (%d file(s))",
+                len(self.manifest),
+            )
+        elif queued:
+            logging.info(
+                "Startup reconciliation queued %d file(s) changed while not running",
+                queued,
+            )
 
     def marker_path(self, relative: str) -> Path:
         digest = hashlib.sha256(relative.encode("utf-8")).hexdigest()
@@ -337,6 +411,9 @@ class UploadWatcher:
                     self.queue(child, is_dir=child.is_dir())
             except OSError:
                 logging.exception("Could not scan new directory: %s", relative)
+        elif after is not None:
+            self.manifest[relative] = list(after)
+            self.persist_manifest()
         return True
 
     def delete(self, relative: str, is_dir: bool) -> bool:
@@ -368,6 +445,8 @@ class UploadWatcher:
         )
         if code:
             logging.info("Remote path already absent; delete satisfied: %s", relative)
+        if self.manifest.pop(relative, None) is not None:
+            self.persist_manifest()
         return True
 
     def process_pending(self) -> None:
@@ -440,6 +519,7 @@ class UploadWatcher:
     def run(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self.add_tree(self.root)
+        self.reconcile_startup()
         self.write_health("starting")
         logging.info(
             "Watching %s with %d persisted queue item(s)", self.root, len(self.pending)
@@ -477,6 +557,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--suppress-dir", required=True)
     parser.add_argument("--health-file", required=True)
     parser.add_argument("--reconcile-service", required=True)
+    parser.add_argument("--manifest-file", default=None)
     parser.add_argument("--debounce", type=float, default=5.0)
     return parser.parse_args()
 
