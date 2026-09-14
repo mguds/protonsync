@@ -2,13 +2,33 @@ package protonwatch
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/protondrive"
 	"github.com/stretchr/testify/require"
 )
+
+// fakeEventSource lets tests control PollEvents/LatestEventID without a real
+// Proton connection.
+type fakeEventSource struct {
+	pollErr      error
+	latestID     string
+	latestErr    error
+	latestCalled int
+}
+
+func (f *fakeEventSource) LatestEventID(context.Context) (string, error) {
+	f.latestCalled++
+	return f.latestID, f.latestErr
+}
+
+func (f *fakeEventSource) PollEvents(context.Context, string) (*protondrive.EventBatch, error) {
+	return nil, f.pollErr
+}
 
 func TestSafeRelative(t *testing.T) {
 	for _, test := range []struct {
@@ -88,6 +108,62 @@ func TestPathsOverlap(t *testing.T) {
 	require.True(t, pathsOverlap("folder/file.txt", "folder"))
 	require.True(t, pathsOverlap("folder/file.txt", "folder/file.txt"))
 	require.False(t, pathsOverlap("folder-a", "folder-b/file.txt"))
+}
+
+func newTestWatcher(t *testing.T, source eventSource) *eventWatcher {
+	t.Helper()
+	dir := t.TempDir()
+	return &eventWatcher{
+		source:     source,
+		stateFile:  filepath.Join(dir, "state.json"),
+		lockFile:   filepath.Join(dir, "lock"),
+		dirtyDir:   filepath.Join(dir, "dirty"),
+		healthFile: filepath.Join(dir, "health.json"),
+	}
+}
+
+// A poll that keeps failing but hasn't been failing for long must not attempt
+// a re-anchor yet - a brief blip should just retry on the next tick.
+func TestPollDoesNotReanchorBeforeThreshold(t *testing.T) {
+	source := &fakeEventSource{pollErr: errors.New("context deadline exceeded")}
+	watcher := newTestWatcher(t, source)
+	watcher.firstPollFailure = time.Now().Add(-1 * time.Minute)
+
+	require.NoError(t, watcher.poll(context.Background()))
+	require.Equal(t, 0, source.latestCalled, "should not attempt a re-anchor before pollFailureReanchorAfter has elapsed")
+	require.False(t, watcher.firstPollFailure.IsZero())
+}
+
+// Once a poll has been failing for longer than pollFailureReanchorAfter,
+// protonwatch must attempt to re-anchor (the same self-heal used for a
+// server-sent Refresh) rather than retrying the same stuck cursor forever.
+func TestPollReanchorsAfterSustainedFailure(t *testing.T) {
+	source := &fakeEventSource{
+		pollErr:   errors.New("context deadline exceeded"),
+		latestErr: errors.New("also unreachable"),
+	}
+	watcher := newTestWatcher(t, source)
+	watcher.firstPollFailure = time.Now().Add(-20 * time.Minute)
+
+	require.NoError(t, watcher.poll(context.Background()))
+	require.Equal(t, 1, source.latestCalled, "should attempt a re-anchor once the failure has been sustained")
+	require.False(t, watcher.firstPollFailure.IsZero(), "failure is still ongoing since the re-anchor attempt itself failed")
+	require.False(t, watcher.lastReanchorAttempt.IsZero())
+}
+
+// A re-anchor attempt must not be retried on every single poll while the
+// outage continues - only after reanchorRetryBackoff has passed again.
+func TestPollReanchorRespectsBackoff(t *testing.T) {
+	source := &fakeEventSource{
+		pollErr:   errors.New("context deadline exceeded"),
+		latestErr: errors.New("also unreachable"),
+	}
+	watcher := newTestWatcher(t, source)
+	watcher.firstPollFailure = time.Now().Add(-20 * time.Minute)
+	watcher.lastReanchorAttempt = time.Now().Add(-1 * time.Minute)
+
+	require.NoError(t, watcher.poll(context.Background()))
+	require.Equal(t, 0, source.latestCalled, "a recent re-anchor attempt should block another one until the backoff elapses")
 }
 
 func TestConflictsWithDirty(t *testing.T) {

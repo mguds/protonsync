@@ -109,6 +109,20 @@ var commandDefinition = &cobra.Command{
 // in-place-reindex recovery paths do their job.
 const protonEventCallTimeout = 2 * time.Minute
 
+// pollFailureReanchorAfter bounds how long poll() will silently retry an
+// event stream that keeps failing before treating it the same as a
+// server-sent Refresh: rebuilding the index and re-anchoring at a fresh
+// event ID. The existing Refresh self-heal only fires when the server
+// actually responds and says the cursor is stale; if instead every request
+// against the current cursor times out with no response at all (a stuck
+// cursor, not just a network blip), the client would otherwise retry that
+// same request forever with no way to recover. reanchorRetryBackoff stops a
+// genuine outage from causing a full-index rebuild attempt on every poll.
+const (
+	pollFailureReanchorAfter = 15 * time.Minute
+	reanchorRetryBackoff     = 10 * time.Minute
+)
+
 type eventWatcher struct {
 	source         eventSource
 	fsrc           fs.Fs
@@ -124,6 +138,9 @@ type eventWatcher struct {
 	healthFile     string
 	pollInterval   time.Duration
 	state          watcherState
+
+	firstPollFailure    time.Time
+	lastReanchorAttempt time.Time
 }
 
 func (w *eventWatcher) requestFallback(err error) error {
@@ -483,8 +500,24 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		// forcing a full bisync.
 		fs.Logf(w.fsrc, "Proton event poll failed; will retry: %v", err)
 		w.writeHealth("degraded", fmt.Sprintf("event poll failed; retrying: %v", err))
+		if w.firstPollFailure.IsZero() {
+			w.firstPollFailure = time.Now()
+		}
+		if failingFor := time.Since(w.firstPollFailure); failingFor > pollFailureReanchorAfter &&
+			time.Since(w.lastReanchorAttempt) > reanchorRetryBackoff {
+			w.lastReanchorAttempt = time.Now()
+			fs.Logf(w.fsrc, "Proton event poll has failed for over %s; re-anchoring in place", failingFor.Round(time.Second))
+			if reErr := w.withLock(func() error { return w.reindex(ctx) }); reErr != nil {
+				fs.Logf(w.fsrc, "Re-anchor after sustained poll failure also failed: %v", reErr)
+				w.writeHealth("degraded", fmt.Sprintf("event poll failing for %s; re-anchor attempt also failed: %v", failingFor.Round(time.Second), reErr))
+			} else {
+				w.firstPollFailure = time.Time{}
+				w.writeHealth("ok", "re-anchored after sustained event poll failure")
+			}
+		}
 		return nil
 	}
+	w.firstPollFailure = time.Time{}
 	if batch.Refresh || batch.EventID == "" {
 		// Proton's event cursor expired. Rebuild the index and re-anchor at
 		// the latest event in place, rather than triggering a full bisync.
