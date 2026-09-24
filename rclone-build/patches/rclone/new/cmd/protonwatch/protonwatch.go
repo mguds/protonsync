@@ -107,7 +107,7 @@ var commandDefinition = &cobra.Command{
 // stalled or endlessly-retried request can hang the watcher indefinitely
 // instead of erroring out and letting the existing degraded/retry and
 // in-place-reindex recovery paths do their job.
-const protonEventCallTimeout = 2 * time.Minute
+const protonEventCallTimeout = 5 * time.Minute
 
 // pollFailureReanchorAfter bounds how long poll() will silently retry an
 // event stream that keeps failing before treating it the same as a
