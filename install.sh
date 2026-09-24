@@ -1021,10 +1021,6 @@ for file in "$STATE"/protonsync-upload-health*.json "$STATE"/protonsync-event-he
     [[ -f "$file" ]] || continue
     found_health=1
     modified=$(stat -c %Y "$file")
-    if (( now - modified > 600 )); then
-        printf 'ERROR: stale health file %s\n' "$file"
-        failed=1
-    fi
     status=$(python3 - "$file" <<'PY'
 import json
 import pathlib
@@ -1037,6 +1033,16 @@ except Exception:
 print(data.get("status", "invalid"))
 PY
 )
+    # A full index rebuild takes 10-20 minutes without refreshing the health
+    # file. Treat it as healthy for up to an hour so remediation never
+    # restarts the watcher midway through a rebuild; longer means stuck.
+    if [[ "$status" == reindexing ]] && (( now - modified <= 3600 )); then
+        continue
+    fi
+    if (( now - modified > 600 )); then
+        printf 'ERROR: stale health file %s\n' "$file"
+        failed=1
+    fi
     case "$status" in
         ok|starting|queued) ;;
         *)

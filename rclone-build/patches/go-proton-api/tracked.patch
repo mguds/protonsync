@@ -1,3 +1,18 @@
+diff --git a/event_drive.go b/event_drive.go
+index 5e625d2..c43a3c2 100644
+--- a/event_drive.go
++++ b/event_drive.go
+@@ -68,6 +68,10 @@ func (c *Client) GetShareEvent(ctx context.Context, shareID, eventID string) (Dr
+ 			return DriveEvent{}, err
+ 		}
+ 
++		// Advance the cursor; without this every further page re-fetched
++		// the second page forever once a backlog spanned three pages.
++		event.EventID = next.EventID
++		event.Refresh = event.Refresh || next.Refresh
+ 		event.Events = append(event.Events, next.Events...)
+ 	}
+ 
 diff --git a/link_types.go b/link_types.go
 index e58d054..6ad0cea 100644
 --- a/link_types.go

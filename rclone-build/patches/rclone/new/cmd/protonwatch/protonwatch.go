@@ -118,12 +118,29 @@ const protonEventCallTimeout = 5 * time.Minute
 // cursor, not just a network blip), the client would otherwise retry that
 // same request forever with no way to recover. reanchorRetryBackoff stops a
 // genuine outage from causing a full-index rebuild attempt on every poll.
+// authFailureExitAfter rate-limits exit-to-re-login so a genuinely broken
+// login cannot turn into a tight restart loop against Proton's auth endpoint.
+const authFailureExitAfter = 10 * time.Minute
+
+// isAuthFailure reports a dead Proton session: the access token was rejected
+// and refreshing it failed (refresh token revoked or rotated elsewhere).
+func isAuthFailure(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "failed to refresh auth") ||
+		strings.Contains(msg, "Invalid refresh token") ||
+		strings.Contains(msg, "Invalid access token")
+}
+
 const (
 	pollFailureReanchorAfter = 15 * time.Minute
 	reanchorRetryBackoff     = 10 * time.Minute
 )
 
 type eventWatcher struct {
+	// morePending is set when the last poll applied a page and Proton
+	// reported further pages; run() then polls again without waiting.
+	morePending    bool
+	started        time.Time
 	source         eventSource
 	fsrc           fs.Fs
 	fdst           fs.Fs
@@ -290,6 +307,10 @@ func (w *eventWatcher) reindex(ctx context.Context) error {
 		return fmt.Errorf("get latest Proton event ID: %w", err)
 	}
 	fs.Logf(w.fsrc, "Building Proton event link index")
+	// A full build takes 10-20 minutes and does not refresh the health file
+	// meanwhile; a distinct status lets protonsync-health tell a working
+	// rebuild apart from a stuck watcher instead of restarting it midway.
+	w.writeHealth("reindexing", fmt.Sprintf("building Proton event link index (%d items previously)", len(w.state.Items)))
 	if err := w.buildIndex(ctx); err != nil {
 		return fmt.Errorf("build Proton event link index: %w", err)
 	}
@@ -498,6 +519,15 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		// A failed poll (network blip, transient API error) is recoverable:
 		// log it and retry on the next tick instead of exiting the process or
 		// forcing a full bisync.
+		if isAuthFailure(err) && time.Since(w.started) > authFailureExitAfter {
+			// The in-memory session is dead (typically its refresh token was
+			// rotated by the upload watcher sharing the same rclone.conf
+			// session). Retrying with it can never succeed; exit without the
+			// fallback marker so the wrapper restarts us with the current
+			// config, keeping event state and index intact.
+			w.writeHealth("degraded", fmt.Sprintf("Proton session invalid; restarting to re-login: %v", err))
+			return fmt.Errorf("proton session invalid, exiting to re-login: %w", err)
+		}
 		fs.Logf(w.fsrc, "Proton event poll failed; will retry: %v", err)
 		w.writeHealth("degraded", fmt.Sprintf("event poll failed; retrying: %v", err))
 		if w.firstPollFailure.IsZero() {
@@ -518,6 +548,7 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		return nil
 	}
 	w.firstPollFailure = time.Time{}
+	w.morePending = false
 	if batch.Refresh || batch.EventID == "" {
 		// Proton's event cursor expired. Rebuild the index and re-anchor at
 		// the latest event in place, rather than triggering a full bisync.
@@ -533,6 +564,7 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		if err := w.saveState(); err != nil {
 			return err
 		}
+		w.morePending = batch.More
 		w.writeHealth("ok", "event poll completed")
 		return nil
 	}
@@ -553,6 +585,7 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 		w.state.EventID = batch.EventID
 		return w.saveState()
 	})
+	w.morePending = err == nil && batch.More
 	if err != nil {
 		// Only an inability to persist progress reaches here.
 		return w.requestFallback(fmt.Errorf("save Proton event state: %w", err))
@@ -567,6 +600,7 @@ func (w *eventWatcher) poll(ctx context.Context) error {
 }
 
 func (w *eventWatcher) run(ctx context.Context) error {
+	w.started = time.Now()
 	if err := w.initialize(ctx); err != nil {
 		return err
 	}
@@ -575,6 +609,9 @@ func (w *eventWatcher) run(ctx context.Context) error {
 	for {
 		if err := w.poll(ctx); err != nil {
 			return err
+		}
+		if w.morePending && ctx.Err() == nil {
+			continue
 		}
 		select {
 		case <-ctx.Done():

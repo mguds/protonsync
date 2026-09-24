@@ -25,6 +25,7 @@ type EventChange struct {
 type EventBatch struct {
 	EventID string
 	Refresh bool
+	More    bool
 	Changes []EventChange
 }
 
@@ -58,6 +59,7 @@ func (f *Fs) PollEvents(ctx context.Context, eventID string) (*EventBatch, error
 	batch := &EventBatch{
 		EventID: source.EventID,
 		Refresh: source.Refresh,
+		More:    source.More,
 		Changes: make([]EventChange, 0, len(source.Changes)),
 	}
 	if batch.Refresh {

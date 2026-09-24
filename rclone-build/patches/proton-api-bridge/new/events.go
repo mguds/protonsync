@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"time"
 
 	"github.com/ProtonMail/gopenpgp/v2/crypto"
 	"github.com/rclone/go-proton-api"
@@ -24,8 +25,16 @@ type DriveEventChange struct {
 type DriveEventBatch struct {
 	EventID string
 	Refresh bool
+	// More reports that further pages follow EventID; callers should apply
+	// this batch, persist EventID and immediately poll again.
+	More    bool
 	Changes []DriveEventChange
 }
+
+// eventPageRequestTimeout bounds the single HTTP request for one event page,
+// so a stalled request fails fast and is retried on the next poll instead of
+// consuming the caller's whole deadline.
+const eventPageRequestTimeout = 60 * time.Second
 
 // GetLatestShareEventID returns the current anchor for the selected share.
 func (protonDrive *ProtonDrive) GetLatestShareEventID(ctx context.Context) (string, error) {
@@ -153,9 +162,12 @@ func (r *eventResolver) linkPath(ctx context.Context, link *proton.Link, memo bo
 	return p, nil
 }
 
-// GetShareEvents returns decrypted changes after eventID for the selected share.
+// GetShareEvents returns one page of decrypted changes after eventID for the
+// selected share. Batch.More reports whether further pages follow.
 func (protonDrive *ProtonDrive) GetShareEvents(ctx context.Context, eventID string) (*DriveEventBatch, error) {
-	events, err := protonDrive.c.GetShareEvent(ctx, protonDrive.MainShare.ShareID, eventID)
+	pageCtx, pageCancel := context.WithTimeout(ctx, eventPageRequestTimeout)
+	events, more, err := protonDrive.c.GetShareEventPage(pageCtx, protonDrive.MainShare.ShareID, eventID)
+	pageCancel()
 	if err != nil {
 		return nil, err
 	}
@@ -163,6 +175,7 @@ func (protonDrive *ProtonDrive) GetShareEvents(ctx context.Context, eventID stri
 	batch := &DriveEventBatch{
 		EventID: events.EventID,
 		Refresh: bool(events.Refresh),
+		More:    more,
 		Changes: make([]DriveEventChange, 0, len(events.Events)),
 	}
 	if batch.Refresh {

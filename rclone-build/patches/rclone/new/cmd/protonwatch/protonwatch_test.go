@@ -15,6 +15,8 @@ import (
 // fakeEventSource lets tests control PollEvents/LatestEventID without a real
 // Proton connection.
 type fakeEventSource struct {
+	batches      []*protondrive.EventBatch
+	polledIDs    []string
 	pollErr      error
 	latestID     string
 	latestErr    error
@@ -26,8 +28,14 @@ func (f *fakeEventSource) LatestEventID(context.Context) (string, error) {
 	return f.latestID, f.latestErr
 }
 
-func (f *fakeEventSource) PollEvents(context.Context, string) (*protondrive.EventBatch, error) {
-	return nil, f.pollErr
+func (f *fakeEventSource) PollEvents(_ context.Context, eventID string) (*protondrive.EventBatch, error) {
+	f.polledIDs = append(f.polledIDs, eventID)
+	if f.pollErr != nil || len(f.batches) == 0 {
+		return nil, f.pollErr
+	}
+	batch := f.batches[0]
+	f.batches = f.batches[1:]
+	return batch, nil
 }
 
 func TestSafeRelative(t *testing.T) {
@@ -176,4 +184,46 @@ func TestConflictsWithDirty(t *testing.T) {
 	conflict, err = watcher.conflictsWithDirty("other")
 	require.NoError(t, err)
 	require.False(t, conflict)
+}
+
+// A multi-page backlog must be consumed page by page: each page's cursor is
+// persisted and used for the next request, and More makes run() poll again
+// without waiting.
+func TestPollAdvancesCursorPageByPage(t *testing.T) {
+	source := &fakeEventSource{batches: []*protondrive.EventBatch{
+		{EventID: "page1", More: true},
+		{EventID: "page2", More: true},
+		{EventID: "page3", More: false},
+	}}
+	watcher := newTestWatcher(t, source)
+	watcher.state.EventID = "start"
+
+	for _, want := range []struct {
+		id   string
+		more bool
+	}{{"page1", true}, {"page2", true}, {"page3", false}} {
+		require.NoError(t, watcher.poll(context.Background()))
+		require.Equal(t, want.id, watcher.state.EventID)
+		require.Equal(t, want.more, watcher.morePending)
+	}
+	require.Equal(t, []string{"start", "page1", "page2"}, source.polledIDs)
+}
+
+// A dead session exits (without the fallback marker, so state and index are
+// kept) to re-login - but never within authFailureExitAfter of starting.
+func TestPollExitsOnAuthFailureAfterGracePeriod(t *testing.T) {
+	authErr := errors.New("failed to refresh auth: failed to refresh auth, de-auth: 400 POST /auth/v4/refresh: Invalid refresh token")
+	source := &fakeEventSource{pollErr: authErr}
+
+	fresh := newTestWatcher(t, source)
+	fresh.started = time.Now()
+	require.NoError(t, fresh.poll(context.Background()))
+
+	old := newTestWatcher(t, source)
+	old.started = time.Now().Add(-20 * time.Minute)
+	require.Error(t, old.poll(context.Background()))
+	_, err := os.Stat(old.fallbackMarker)
+	require.True(t, old.fallbackMarker == "" || errors.Is(err, os.ErrNotExist), "auth exit must not request a fallback re-index")
+
+	require.False(t, isAuthFailure(errors.New("context deadline exceeded")))
 }
